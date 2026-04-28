@@ -25,6 +25,7 @@ enum SettingsDlgId {
     IDC_CACHE_DIR_RESET  = 413,
     IDC_CACHE_SIZE_LABEL = 420,
     IDC_CACHE_CLEAR      = 421,
+    IDC_CLOSE_TO_TRAY    = 430,
 };
 
 struct SettingsDlgData {
@@ -160,6 +161,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
 
         SendDlgItemMessageW(dlg, IDC_VM_DIR_EDIT, EM_SETREADONLY, TRUE, 0);
         SendDlgItemMessageW(dlg, IDC_CACHE_DIR_EDIT, EM_SETREADONLY, TRUE, 0);
+
+        CheckDlgButton(dlg, IDC_CLOSE_TO_TRAY,
+            data->mgr->app_settings().close_to_tray ? BST_CHECKED : BST_UNCHECKED);
         return TRUE;
     }
 
@@ -207,6 +211,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
             return TRUE;
         }
 
+        case IDC_CLOSE_TO_TRAY: {
+            if (HIWORD(wp) == BN_CLICKED) {
+                bool checked = IsDlgButtonChecked(dlg, IDC_CLOSE_TO_TRAY) == BST_CHECKED;
+                data->mgr->app_settings().close_to_tray = checked;
+                SaveAndMark(data);
+            }
+            return TRUE;
+        }
+
         case IDC_CACHE_CLEAR: {
             auto dir = EffectiveImagesDir(data->mgr);
             auto stats = ComputeCacheStats(dir);
@@ -245,7 +258,7 @@ bool ShowSettingsDialog(HWND parent, ManagerService& mgr) {
     using S = i18n::S;
     DlgBuilder b;
 
-    int W = 340, H = 170;
+    int W = 340, H = 195;
     b.Begin(i18n::tr(S::kDlgSettings), 0, 0, W, H,
             WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT);
 
@@ -278,6 +291,11 @@ bool ShowSettingsDialog(HWND parent, ManagerService& mgr) {
     b.AddStatic(IDC_CACHE_SIZE_LABEL, "", x, y + 2, 160, 10);
     b.AddButton(IDC_CACHE_CLEAR, i18n::tr(S::kSettingsClearCache),
                 x + 162, y, clear_btn_w, btn_h);
+    y += row_h + 8;
+
+    // Close-to-tray checkbox
+    b.AddCheckBox(IDC_CLOSE_TO_TRAY, i18n::tr(S::kSettingsCloseToTray),
+                  x, y, W - 16, 12);
 
     SettingsDlgData data{};
     data.mgr = &mgr;

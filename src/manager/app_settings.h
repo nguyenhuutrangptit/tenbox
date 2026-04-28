@@ -43,6 +43,7 @@ struct AppSettings {
     WindowGeometry window;
     std::vector<std::string> vm_paths;
     bool show_toolbar = true;
+    bool close_to_tray = true;      // X button hides to system tray instead of quitting
     std::string vm_storage_dir;     // empty = DefaultVmStorageDir()
     std::string image_cache_dir;    // empty = DefaultImageCacheDir(data_dir)
     std::vector<image_source::ImageSource> sources; // empty = use DefaultSources()

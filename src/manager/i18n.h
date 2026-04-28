@@ -313,6 +313,11 @@ enum class S {
     kLlmEnableLogging,
     kLlmLoggingHint,
 
+    // System tray
+    kTrayShow,
+    kTrayHide,
+    kSettingsCloseToTray,
+
     kCount  // Must be last
 };
 

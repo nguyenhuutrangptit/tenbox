@@ -60,6 +60,7 @@ enum CmdId : UINT {
     IDM_DPI_ZOOM      = 1026,
     IDM_LLM_PROXY     = 1027,
     IDM_HELP_DOC      = 1028,
+    IDM_TRAY_TOGGLE   = 1029,
 };
 
 // ── Control IDs ──
@@ -73,6 +74,10 @@ enum CtlId : UINT {
 
 // WM_APP range for cross-thread invoke
 static constexpr UINT WM_INVOKE = WM_APP + 100;
+
+// Tray icon notification callback message
+static constexpr UINT WM_TRAY_NOTIFY = WM_APP + 200;
+static constexpr UINT kTrayIconId = 1;
 
 // Suppress host→guest clipboard echo after we write VM data to the clipboard.
 // Uses a timestamp instead of a simple bool because EmptyClipboard() +
@@ -139,6 +144,10 @@ struct Win32UiShell::Impl {
     HWND statusbar  = nullptr;
     HWND tab        = nullptr;
     HMENU menu_bar  = nullptr;
+
+    NOTIFYICONDATAW nid{};   // tray icon data
+    bool tray_added = false; // true after Shell_NotifyIcon(NIM_ADD)
+    bool real_exit  = false; // true => bypass close-to-tray and actually quit
 
     bool display_available = false;
 
@@ -233,6 +242,42 @@ static void BlitFrameToState(VmUiState& state, const DisplayFrame& frame) {
         std::memcpy(state.framebuffer.data() + dst_off,
                     frame.data() + src_off, dw * 4);
     }
+}
+
+// ── Tray icon helpers ──
+
+// Persist current window geometry to settings. Used both on real exit and
+// before hiding to tray, so that on the next launch the window restores to
+// the user's last visible position even if exit happens while tray-hidden.
+static void SaveCurrentGeometry(Win32UiShell::Impl* p, ManagerService& mgr) {
+    if (!p->hwnd) return;
+    if (!IsWindowVisible(p->hwnd)) return;  // would read 0,0 / hidden coords
+    RECT wr;
+    GetWindowRect(p->hwnd, &wr);
+    auto& geo = mgr.app_settings().window;
+    geo.x      = wr.left;
+    geo.y      = wr.top;
+    geo.width  = wr.right - wr.left;
+    geo.height = wr.bottom - wr.top;
+    mgr.SaveAppSettings();
+}
+
+static void ShowMainWindow(Win32UiShell::Impl* p) {
+    if (!p->hwnd) return;
+    if (!IsWindowVisible(p->hwnd)) {
+        ShowWindow(p->hwnd, SW_SHOW);
+    }
+    if (IsIconic(p->hwnd)) {
+        ShowWindow(p->hwnd, SW_RESTORE);
+    }
+    SetForegroundWindow(p->hwnd);
+}
+
+static void HideMainWindowToTray(Win32UiShell::Impl* p, ManagerService& mgr) {
+    if (!p->hwnd) return;
+    // Save geometry while still visible so a later real_exit can preserve it.
+    SaveCurrentGeometry(p, mgr);
+    ShowWindow(p->hwnd, SW_HIDE);
 }
 
 // ── Window class registration ──
@@ -823,8 +868,20 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 });
             return 0;
         case IDM_EXIT:
+            // Real exit path: bypass close-to-tray and run the existing
+            // running-VM confirmation flow in WM_CLOSE.
+            p->real_exit = true;
             SendMessage(hwnd, WM_CLOSE, 0, 0);
             return 0;
+        case IDM_TRAY_TOGGLE: {
+            bool visible = IsWindowVisible(p->hwnd) && !IsIconic(p->hwnd);
+            if (visible) {
+                HideMainWindowToTray(p, shell->manager_);
+            } else {
+                ShowMainWindow(p);
+            }
+            return 0;
+        }
         case IDM_WEBSITE: {
             SHELLEXECUTEINFOW sei{sizeof(sei)};
             sei.hwnd = hwnd;
@@ -1198,6 +1255,68 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_TRAY_NOTIFY: {
+        if (!p) break;
+        // With NOTIFYICON_VERSION_4, the icon ID is in HIWORD(lp); but we
+        // only use a single icon, so we don't need to filter by ID.
+        //
+        // Important: under v4, a single left-click delivers BOTH WM_LBUTTONUP
+        // and NIN_SELECT. Handling both toggles the window twice and causes a
+        // visible flicker. We listen only on NIN_SELECT / NIN_KEYSELECT and
+        // ignore the legacy mouse-up / double-click messages here.
+        UINT event = LOWORD(lp);
+        switch (event) {
+        case NIN_SELECT:
+        case NIN_KEYSELECT: {
+            // Tray click only ever shows / focuses the window; it never
+            // hides it. This matches the convention of common Windows tray
+            // apps (Discord, Steam, ...) and side-steps the v4 double-click
+            // flicker, since a 2nd NIN_SELECT on an already-visible window
+            // is a no-op. Hiding is done via the X button or the tray
+            // context menu's "Hide to Tray" item.
+            ShowMainWindow(p);
+            return 0;
+        }
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU: {
+            // Show context menu at cursor. SetForegroundWindow first so the
+            // popup is dismissed when the user clicks elsewhere.
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+
+            HMENU menu = CreatePopupMenu();
+            if (!menu) return 0;
+            bool visible = IsWindowVisible(p->hwnd) && !IsIconic(p->hwnd);
+            std::wstring toggle_label = visible
+                ? i18n::tr_w(i18n::S::kTrayHide)
+                : i18n::tr_w(i18n::S::kTrayShow);
+            AppendMenuW(menu, MF_STRING, IDM_TRAY_TOGGLE, toggle_label.c_str());
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, IDM_EXIT,
+                        i18n::tr_w(i18n::S::kMenuExit).c_str());
+
+            // Default item shown in bold; left-click on tray uses this.
+            SetMenuDefaultItem(menu, IDM_TRAY_TOGGLE, FALSE);
+
+            UINT cmd = TrackPopupMenuEx(menu,
+                TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x, pt.y, hwnd, nullptr);
+            DestroyMenu(menu);
+
+            // Posting WM_NULL is the documented workaround so the menu
+            // disappears immediately when the user clicks outside it.
+            PostMessage(hwnd, WM_NULL, 0, 0);
+
+            if (cmd != 0) {
+                SendMessage(hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+            }
+            return 0;
+        }
+        }
+        return 0;
+    }
+
     case WM_CLIPBOARDUPDATE:
         if (GetTickCount64() >= g_clipboard_suppress_until) {
             auto vms = shell->manager_.ListVms();
@@ -1211,6 +1330,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_CLOSE:
+        // Default behavior: clicking X minimizes to tray when enabled.
+        // IDM_EXIT and the tray "Exit" command set p->real_exit first to
+        // bypass this and fall through to the running-VM confirm + quit.
+        if (p && !p->real_exit && p->tray_added &&
+            shell->manager_.app_settings().close_to_tray) {
+            HideMainWindowToTray(p, shell->manager_);
+            return 0;
+        }
         {
             auto vms = shell->manager_.ListVms();
             int running_count = 0;
@@ -1226,11 +1353,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int result = MessageBoxW(hwnd, i18n::to_wide(exit_msg).c_str(), i18n::tr_w(i18n::S::kConfirmExitTitle).c_str(),
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
                 if (result != IDYES) {
+                    // User cancelled exit; keep the app running, but reset
+                    // the real_exit flag so a later X-click still goes to tray.
+                    if (p) p->real_exit = false;
                     return 0;
                 }
             }
         }
-        {
+        if (IsWindowVisible(hwnd)) {
             RECT wr;
             GetWindowRect(hwnd, &wr);
             auto& geo = shell->manager_.app_settings().window;
@@ -1388,6 +1518,31 @@ Win32UiShell::Win32UiShell(ManagerService& manager)
     impl_->left_pane_width = impl_->Dpi(kDefaultLeftPaneWidth96);
 
     AddClipboardFormatListener(impl_->hwnd);
+
+    {
+        NOTIFYICONDATAW& nid = impl_->nid;
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = impl_->hwnd;
+        nid.uID = kTrayIconId;
+        // NIF_SHOWTIP is required under NOTIFYICON_VERSION_4: v4 suppresses
+        // the standard tooltip by default (so apps can draw their own popup
+        // UI). Adding NIF_SHOWTIP brings back the standard hover tooltip.
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+        nid.uCallbackMessage = WM_TRAY_NOTIFY;
+        nid.hIcon = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(IDI_APP_ICON),
+            IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+        if (!nid.hIcon) nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        std::wstring tip = i18n::tr_w(i18n::S::kAppTitle);
+        // szTip is 128 wchars including NUL; truncate if needed.
+        if (tip.size() > 127) tip.resize(127);
+        wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+        if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+            impl_->tray_added = true;
+            nid.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        }
+    }
 
     impl_->toolbar = CreateToolbar(impl_->hwnd, hinst, impl_->dpi);
     if (!manager_.app_settings().show_toolbar) {
@@ -1653,6 +1808,10 @@ Win32UiShell::~Win32UiShell() {
         g_invoke_queue.clear();
     }
 
+    if (impl_->tray_added) {
+        Shell_NotifyIconW(NIM_DELETE, &impl_->nid);
+        impl_->tray_added = false;
+    }
     if (impl_->hwnd) {
         RemoveClipboardFormatListener(impl_->hwnd);
     }
@@ -1698,7 +1857,7 @@ void Win32UiShell::Quit() {
         SetThreadExecutionState(ES_CONTINUOUS);
         sleep_prevented_ = false;
     }
-    if (impl_->hwnd) {
+    if (impl_->hwnd && IsWindowVisible(impl_->hwnd)) {
         RECT wr;
         GetWindowRect(impl_->hwnd, &wr);
         auto& geo = manager_.app_settings().window;

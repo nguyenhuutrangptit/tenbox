@@ -257,6 +257,11 @@ static const std::unordered_map<S, const char*> kStringsEn = {
     {S::kLlmHint, "VMs can access LLM APIs via http://10.0.2.3/ with any API key. The real API credentials are securely managed here."},
     {S::kLlmEnableLogging, "Log all LLM requests (JSONL)"},
     {S::kLlmLoggingHint, "Log directory: "},
+
+    // System tray
+    {S::kTrayShow, "Show TenBox"},
+    {S::kTrayHide, "Hide to Tray"},
+    {S::kSettingsCloseToTray, "Close button minimizes to system tray"},
 };
 
 // Simplified Chinese strings; each key explicitly bound (no order dependency)
@@ -503,6 +508,11 @@ static const std::unordered_map<S, const char*> kStringsZhCN = {
     {S::kLlmHint, "虚拟机内可通过 http://10.0.2.3/ 使用任意 API Key 即可访问大模型接口，真实的 API 信息在此安全管理，也可在此切换模型映射。"},
     {S::kLlmEnableLogging, "记录所有 LLM 请求日志 (JSONL)"},
     {S::kLlmLoggingHint, "日志目录: "},
+
+    // System tray
+    {S::kTrayShow, "显示 TenBox"},
+    {S::kTrayHide, "隐藏到托盘"},
+    {S::kSettingsCloseToTray, "点击关闭按钮时最小化到系统托盘"},
 };
 
 void InitLanguage() {

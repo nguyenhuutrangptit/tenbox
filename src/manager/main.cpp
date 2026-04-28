@@ -93,7 +93,11 @@ static constexpr const wchar_t* kWndClass = L"TenBoxManagerWin32";
 static bool ActivateExistingInstance() {
     HWND hwnd = FindWindowW(kWndClass, nullptr);
     if (hwnd) {
-        if (IsIconic(hwnd))
+        // Window may be hidden (close-to-tray), minimized, or just behind
+        // other windows. Bring it back in all three cases.
+        if (!IsWindowVisible(hwnd))
+            ShowWindow(hwnd, SW_SHOW);
+        else if (IsIconic(hwnd))
             ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
         return true;

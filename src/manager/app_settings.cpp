@@ -112,6 +112,9 @@ AppSettings LoadSettings(const std::string& data_dir) {
         if (j.contains("show_toolbar") && j["show_toolbar"].is_boolean()) {
             s.show_toolbar = j["show_toolbar"].get<bool>();
         }
+        if (j.contains("close_to_tray") && j["close_to_tray"].is_boolean()) {
+            s.close_to_tray = j["close_to_tray"].get<bool>();
+        }
         if (j.contains("vm_storage_dir") && j["vm_storage_dir"].is_string()) {
             auto v = j["vm_storage_dir"].get<std::string>();
             if (!v.empty()) s.vm_storage_dir = v;
@@ -195,6 +198,7 @@ void SaveSettings(const std::string& data_dir, const AppSettings& s) {
     json j;
     j["window"]           = w;
     j["show_toolbar"]     = s.show_toolbar;
+    j["close_to_tray"]    = s.close_to_tray;
     j["vm_paths"]         = vm_paths_json;
     if (!s.vm_storage_dir.empty())
         j["vm_storage_dir"] = s.vm_storage_dir;
