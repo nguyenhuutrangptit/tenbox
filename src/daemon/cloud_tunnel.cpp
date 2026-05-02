@@ -518,25 +518,22 @@ bool CloudTunnel::Connect(std::string* error) {
         url.target += "host_id=" + host_id_;
     }
 
-    // Default to IPv4 only. The cloud gateway (my.tenbox.ai) is fronted by
-    // Cloudflare, which is dual-stack — but in practice plenty of home /
-    // SMB / single-board-computer environments (RK3588 boards, consumer
-    // routers, etc.) advertise an IPv6 default route that doesn't actually
-    // forward traffic. Without this hint glibc's RFC 6724 sort would put
-    // AAAA first, the connect() below would either time out or stall, and
-    // the user only sees a generic "failed to read WebSocket handshake"
-    // log line with no clue that the daemon never got past TCP.
+    // Use the system's default address selection (AF_UNSPEC -> RFC 6724
+    // ordering in glibc), same as curl / browsers. We briefly defaulted
+    // to IPv4-only to work around what looked like an IPv6 reachability
+    // problem on a single-board-computer test host; the actual failure
+    // there was the tick-thread race fixed in 0.7.14, not IPv6.
     //
-    // Operators on IPv6-only networks can opt back in with
-    // TENBOX_CLOUD_PREFER_FAMILY=v6 (single-stack v6) or =any
-    // (dual-stack with v6 preferred — pre-fix behaviour).
+    // Operators stuck on broken dual-stack networks (rare: an AAAA route
+    // is advertised but doesn't forward) can still pin the family with
+    // TENBOX_CLOUD_PREFER_FAMILY=v4 / v6 in the systemd EnvironmentFile.
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     if (const char* fam = std::getenv("TENBOX_CLOUD_PREFER_FAMILY")) {
-        if (std::string_view(fam) == "v6") hints.ai_family = AF_INET6;
-        else if (std::string_view(fam) == "any") hints.ai_family = AF_UNSPEC;
-        // anything else (including "v4") falls through to AF_INET.
+        if (std::string_view(fam) == "v4") hints.ai_family = AF_INET;
+        else if (std::string_view(fam) == "v6") hints.ai_family = AF_INET6;
+        // anything else (including "any") leaves AF_UNSPEC.
     }
 
     addrinfo* result = nullptr;
