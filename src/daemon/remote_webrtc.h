@@ -71,6 +71,14 @@ using DataChannelMessageHandler = std::function<void(const nlohmann::json&)>;
 // silently dropped by SendOnDataChannel.
 using DataChannelOpenHandler = std::function<void(const std::string& label)>;
 
+// Fired for every host-side ICE candidate as it is gathered. The
+// embedder is expected to forward the candidate to the remote peer over
+// whatever signaling channel is in use (cloud websocket relay in the
+// production setup). Candidates included in the initial WebRtcAnswer
+// are *also* delivered through this handler if it is installed before
+// AcceptOffer; deduplication is the embedder's responsibility.
+using LocalIceCandidateHandler = std::function<void(nlohmann::json candidate)>;
+
 class WebRtcPeer {
 public:
     virtual ~WebRtcPeer() = default;
@@ -80,6 +88,7 @@ public:
     virtual void SetVideoBitrate(uint32_t bitrate_bps) = 0;
     virtual void SetDataChannelHandler(DataChannelMessageHandler handler) = 0;
     virtual void SetDataChannelOpenHandler(DataChannelOpenHandler handler) = 0;
+    virtual void SetLocalIceCandidateHandler(LocalIceCandidateHandler handler) = 0;
     // Send a JSON text frame to a specific data channel (typically "control"
     // for clipboard / status events). Returns false if the channel doesn't
     // exist or isn't open yet; the caller is expected to drop the message.
@@ -90,5 +99,12 @@ std::shared_ptr<WebRtcPeer> CreateWebRtcPeer(
     RemoteFrameReader frame_reader = {},
     PixelFormat preferred_video_format = PixelFormat::kYuv420p);
 bool NativeWebRtcAvailable();
+
+// Returns the resolved STUN URL list (TENBOX_STUN_SERVERS override or the
+// CN-leaning defaults). Exposed so the cloud tunnel can advertise the
+// same servers to the browser-side RTCPeerConnection - keeping both sides
+// of the connection probing the same set avoids one peer giving up on
+// srflx because it picked a server the other peer cannot reach.
+std::vector<std::string> ResolvedStunServers();
 
 }  // namespace tenbox::daemon

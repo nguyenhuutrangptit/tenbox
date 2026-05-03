@@ -5,6 +5,7 @@
 #include <rtc/plihandler.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -15,9 +16,11 @@
 #include <inttypes.h>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace tenbox::daemon {
 
@@ -70,6 +73,50 @@ const char* PeerStateName(int state) {
     }
 }
 
+// Returns the configured STUN URL list. `TENBOX_STUN_SERVERS` is a
+// comma-separated list (whitespace tolerated) of full URLs such as
+// "stun:stun.qq.com:3478,stun:stun.miwifi.com:3478". Empty entries
+// are skipped.
+//
+// Defaults are skewed for mainland China deployments because that's where
+// most of the production fleet lives today and Google STUN
+// (stun.l.google.com:19302) is regularly UDP-blackholed by CN ISPs,
+// which previously made WebRTC setup time out at "creating answer".
+// Order matters - libdatachannel probes them in sequence:
+//   1. Tencent  - rock solid in CN, used by every domestic Live SDK
+//   2. Xiaomi   - secondary domestic option, embedded in MiWiFi routers
+//   3. Cloudflare - global fallback for users outside CN; CF anycast is
+//                   reachable with low latency from the mainland too,
+//                   so it doubles as a third tier when the first two are
+//                   busy or filtered.
+// Operators can override the whole list with TENBOX_STUN_SERVERS, e.g.
+// to point at a self-hosted coturn or to add TURN once we have one.
+std::vector<std::string> ConfiguredStunServers() {
+    const char* raw = std::getenv("TENBOX_STUN_SERVERS");
+    std::vector<std::string> out;
+    if (raw && raw[0] != '\0') {
+        std::string_view view(raw);
+        size_t start = 0;
+        while (start <= view.size()) {
+            size_t comma = view.find(',', start);
+            size_t end = comma == std::string_view::npos ? view.size() : comma;
+            size_t s = start;
+            size_t e = end;
+            while (s < e && std::isspace(static_cast<unsigned char>(view[s]))) ++s;
+            while (e > s && std::isspace(static_cast<unsigned char>(view[e - 1]))) --e;
+            if (e > s) out.emplace_back(view.substr(s, e - s));
+            if (comma == std::string_view::npos) break;
+            start = comma + 1;
+        }
+    }
+    if (out.empty()) {
+        out.emplace_back("stun:stun.qq.com:3478");
+        out.emplace_back("stun:stun.miwifi.com:3478");
+        out.emplace_back("stun:stun.cloudflare.com:3478");
+    }
+    return out;
+}
+
 std::string StripLipSyncGroups(std::string sdp) {
     std::string filtered;
     filtered.reserve(sdp.size());
@@ -101,7 +148,16 @@ public:
         : frame_reader_(std::move(frame_reader)),
           preferred_video_format_(preferred_video_format) {
         rtc::Configuration config;
-        config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+        for (const auto& url : ConfiguredStunServers()) {
+            try {
+                config.iceServers.emplace_back(url);
+            } catch (const std::exception& e) {
+                std::fprintf(stdout,
+                             "[WARN]  remote_webrtc: ignoring invalid STUN url %s: %s\n",
+                             url.c_str(), e.what());
+                std::fflush(stdout);
+            }
+        }
         config.disableAutoNegotiation = true;
         peer_ = std::make_shared<rtc::PeerConnection>(std::move(config));
         peer_->onStateChange([this](rtc::PeerConnection::State state) {
@@ -131,11 +187,32 @@ public:
             cv_.notify_all();
         });
         peer_->onLocalCandidate([this](rtc::Candidate candidate) {
-            std::lock_guard<std::mutex> lock(mu_);
-            candidates_.push_back({
+            nlohmann::json entry = {
                 {"candidate", std::string(candidate)},
                 {"sdpMid", candidate.mid()},
-            });
+            };
+            LocalIceCandidateHandler handler;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                candidates_.push_back(entry);
+                handler = local_ice_handler_;
+            }
+            // Trickle every host-side candidate to the embedder so the
+            // browser can start probing as soon as gathering produces
+            // host / srflx entries, instead of having to wait for the
+            // initial answer's `candidates[]` (which we cap at a short
+            // gathering window so STUN-blackholed networks don't stall
+            // session creation).
+            if (handler) {
+                try {
+                    handler(std::move(entry));
+                } catch (const std::exception& e) {
+                    std::fprintf(stdout,
+                                 "[ERROR] remote_webrtc: local ice handler threw: %s\n",
+                                 e.what());
+                    std::fflush(stdout);
+                }
+            }
         });
         peer_->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
             if (state == rtc::PeerConnection::GatheringState::Complete) {
@@ -183,12 +260,35 @@ public:
             peer_->setRemoteDescription(rtc::Description(sdp, "offer"));
             peer_->setLocalDescription(rtc::Description::Type::Answer);
 
+            // Wait long enough to (a) absolutely require the answer SDP and
+            // (b) opportunistically pick up gathered candidates so the
+            // initial answer carries something useful.
+            //
+            // `description_ready_` is hard: without local SDP we have no
+            // answer to hand back, so we error out. `gathering_complete_`
+            // is intentionally soft - if STUN servers are unreachable
+            // (common on locked-down networks: 19302/UDP black-holed by
+            // ISP, no TURN configured), libdatachannel keeps waiting on
+            // the binding response indefinitely. Returning the SDP with
+            // whatever host candidates we already have lets LAN peers
+            // connect, and the `LocalIceCandidateHandler` continues to
+            // trickle later srflx/relay candidates as they arrive.
             std::unique_lock<std::mutex> lock(mu_);
-            const bool ready = cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+            cv_.wait_for(lock, std::chrono::seconds(10), [this] {
                 return description_ready_ && gathering_complete_;
             });
-            if (!ready || local_sdp_.empty()) {
+            if (local_sdp_.empty()) {
                 return WebRtcAnswer{.ok = false, .error = "timed out creating WebRTC answer"};
+            }
+            if (!gathering_complete_) {
+                std::fprintf(stdout,
+                             "[WARN]  remote_webrtc: returning answer before ICE "
+                             "gathering finished (%zu host candidate(s) so far); "
+                             "remaining candidates will trickle. Check STUN "
+                             "reachability or set TENBOX_STUN_SERVERS to a "
+                             "reachable server list.\n",
+                             candidates_.size());
+                std::fflush(stdout);
             }
             return WebRtcAnswer{
                 .ok = true,
@@ -240,6 +340,33 @@ public:
     void SetDataChannelHandler(DataChannelMessageHandler handler) override {
         std::lock_guard<std::mutex> lock(mu_);
         dc_handler_ = std::move(handler);
+    }
+
+    void SetLocalIceCandidateHandler(LocalIceCandidateHandler handler) override {
+        // Snapshot any candidates already gathered before the embedder
+        // installed the trickle handler (typical race: handler is
+        // attached right after CreateWebRtcPeer but onLocalCandidate
+        // fires from the libdatachannel worker as soon as
+        // setLocalDescription is called). Replaying ensures the browser
+        // ends up with the same candidate set regardless of timing.
+        std::vector<nlohmann::json> backlog;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            local_ice_handler_ = handler;
+            if (handler && !candidates_.empty()) {
+                for (const auto& c : candidates_) backlog.push_back(c);
+            }
+        }
+        for (auto& c : backlog) {
+            try {
+                handler(std::move(c));
+            } catch (const std::exception& e) {
+                std::fprintf(stdout,
+                             "[ERROR] remote_webrtc: local ice handler threw on backlog: %s\n",
+                             e.what());
+                std::fflush(stdout);
+            }
+        }
     }
 
     void SetDataChannelOpenHandler(DataChannelOpenHandler handler) override {
@@ -1153,6 +1280,7 @@ private:
     std::vector<std::shared_ptr<rtc::DataChannel>> data_channels_;
     DataChannelMessageHandler dc_handler_;
     DataChannelOpenHandler dc_open_handler_;
+    LocalIceCandidateHandler local_ice_handler_;
     std::shared_ptr<rtc::Track> video_track_;
     std::shared_ptr<rtc::Track> audio_track_;
     std::thread video_thread_;
@@ -1185,6 +1313,10 @@ std::shared_ptr<WebRtcPeer> CreateWebRtcPeer(
 
 bool NativeWebRtcAvailable() {
     return true;
+}
+
+std::vector<std::string> ResolvedStunServers() {
+    return ConfiguredStunServers();
 }
 
 }  // namespace tenbox::daemon

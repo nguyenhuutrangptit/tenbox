@@ -1625,6 +1625,32 @@ std::shared_ptr<WebRtcPeer> CloudTunnel::CreateRemotePeer(
         peer->SetDataChannelHandler([this, vm_id](const nlohmann::json& message) {
             HandleDataChannelMessage(vm_id, message);
         });
+        // Trickle host-side ICE candidates back to the browser through the
+        // existing `remote_signal.candidate` cloud relay envelope. The
+        // browser-side hostBus router (`remote_signal.candidate` listener
+        // in RemoteDesktopPanel) feeds them to RTCPeerConnection.addIceCandidate.
+        // Without this, AcceptOffer's softened gathering window would only
+        // ship whatever candidates were collected within ~10s; on STUN-blocked
+        // networks the answer sometimes returns with zero candidates and
+        // the browser would have nothing to connect to.
+        peer->SetLocalIceCandidateHandler(
+            [this, session_id, vm_id](nlohmann::json candidate) {
+                if (fd_ < 0) return;
+                nlohmann::json payload = {
+                    {"session_id", session_id},
+                };
+                for (auto it = candidate.begin(); it != candidate.end(); ++it) {
+                    payload[it.key()] = it.value();
+                }
+                (void)SendJson({
+                    {"id", GenerateUuid()},
+                    {"type", "remote_signal.candidate"},
+                    {"host_id", host_id_},
+                    {"vm_id", vm_id},
+                    {"session_id", session_id},
+                    {"payload", std::move(payload)},
+                });
+            });
         // When the control DC opens, push the latest cached cursor so the
         // browser is in sync even if MOVE_CURSOR events fired (and were
         // dropped) while the channel was still in DTLS/SCTP setup.
@@ -1802,10 +1828,20 @@ nlohmann::json CloudTunnel::CreateRemoteSession(const std::string& vm_id, const 
     auto json = ToJson(*session);
     json["video_bitrate_bps"] = video_bitrate_bps;
     json["video_pixel_format"] = RemoteVideoPixelFormatName(video_pixel_format);
+    // Advertise the same STUN list the daemon itself is using so both
+    // peers agree on the candidate-gathering servers (see ResolvedStunServers
+    // for why the defaults skew toward CN-reachable hosts; operators can
+    // override via TENBOX_STUN_SERVERS).
+    nlohmann::json ice_urls = nlohmann::json::array();
+    for (const auto& url : ResolvedStunServers()) ice_urls.push_back(url);
     json["ice_servers"] = nlohmann::json::array({
-        {{"urls", nlohmann::json::array({"stun:stun.l.google.com:19302"})}},
+        {{"urls", std::move(ice_urls)}},
     });
-    json["runtime"] = runtime_manager_.RemoteRuntimeSnapshot(vm_id);
+    // Public snapshot: scrub cursor pixels / clipboard / audio so the cloud
+    // relay never observes guest-visible content. Browser receives those
+    // exclusively through the WebRTC control DataChannel.
+    json["runtime"] = runtime_manager_.RemoteRuntimeSnapshot(
+        vm_id, RuntimeManager::SnapshotScope::kPublic);
     json["webrtc_ready"] = NativeWebRtcAvailable();
     json["message"] = NativeWebRtcAvailable()
         ? "remote session signaling is ready"

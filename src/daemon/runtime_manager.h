@@ -87,7 +87,14 @@ public:
                          RemoteVideoFrame* frame,
                          bool need_full_frame,
                          std::chrono::milliseconds wait_timeout = std::chrono::milliseconds(0));
-    nlohmann::json RemoteRuntimeSnapshot(const std::string& vm_id) const;
+    // Snapshot scope. `kPublic` strips every field that carries guest-visible
+    // content (cursor pixels, clipboard metadata, audio metadata). It is the
+    // only variant we are allowed to put on a wire that the cloud relay can
+    // observe in plaintext, because our threat model treats the relay as
+    // untrusted. `kInternal` keeps everything for in-process callers.
+    enum class SnapshotScope { kPublic, kInternal };
+    nlohmann::json RemoteRuntimeSnapshot(const std::string& vm_id,
+                                         SnapshotScope scope = SnapshotScope::kInternal) const;
     // Returns the most recently observed cursor JSON for `vm_id`, or an empty
     // object if no cursor event has been seen yet (or the VM is gone). Used
     // by the cloud tunnel to seed a freshly opened control DataChannel,

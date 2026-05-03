@@ -1079,7 +1079,8 @@ bool RuntimeManager::SetRemoteVideoPixelFormat(const std::string& vm_id, PixelFo
     return true;
 }
 
-nlohmann::json RuntimeManager::RemoteRuntimeSnapshot(const std::string& vm_id) const {
+nlohmann::json RuntimeManager::RemoteRuntimeSnapshot(const std::string& vm_id,
+                                                     SnapshotScope scope) const {
     auto session = FindSession(vm_id);
     if (!session) return {{"running", false}};
     bool framebuffer_ready = false;
@@ -1088,15 +1089,25 @@ nlohmann::json RuntimeManager::RemoteRuntimeSnapshot(const std::string& vm_id) c
         framebuffer_ready = session->framebuffer && session->framebuffer->IsValid();
     }
     std::lock_guard<std::mutex> lock(session->console_mutex);
-    return {
+    nlohmann::json snapshot = {
         {"running", true},
         {"display", session->display_state},
         {"frame", session->last_frame},
         {"framebuffer_ready", framebuffer_ready},
-        {"cursor", session->cursor},
-        {"audio", session->last_audio},
-        {"clipboard", session->last_clipboard},
     };
+    // Guest-visible state (cursor bitmap, clipboard activity metadata,
+    // audio activity metadata) MUST NOT appear in a Public snapshot — that
+    // payload travels over the cloud websocket relay, which our threat model
+    // treats as untrusted. Browsers receive these via the WebRTC `control`
+    // DataChannel after DTLS/SRTP is up; the daemon seeds the latest cursor
+    // on channel-open in cloud_tunnel so a late-attaching peer is not stuck
+    // waiting for the next MOVE_CURSOR (virtio_gpu source-side dedup).
+    if (scope == SnapshotScope::kInternal) {
+        snapshot["cursor"] = session->cursor;
+        snapshot["audio"] = session->last_audio;
+        snapshot["clipboard"] = session->last_clipboard;
+    }
+    return snapshot;
 }
 
 nlohmann::json RuntimeManager::CursorSnapshot(const std::string& vm_id) const {
