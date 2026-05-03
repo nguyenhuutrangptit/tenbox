@@ -60,11 +60,14 @@ private:
     void HandleDevicePairInvalid();
     void HandleDeviceUnauthorized(const nlohmann::json& payload);
     nlohmann::json HandleRequest(const nlohmann::json& request);
-    // Returns either an immediate error envelope (vms_running /
-    // update_disabled) or `nullptr` to signal "an upgrade worker has
-    // been spawned and will SendJson the final reply itself". The
-    // dispatch loop in ThreadMain() honours the null sentinel by
-    // skipping its own SendJson(reply) call.
+    // Synchronous response is one of:
+    //   - vms_running / update_disabled error envelope (rejected),
+    //   - {ok:true, accepted:true, from, to} ack (apt worker spawned).
+    // On the ack path the spawned worker may additionally push a
+    // best-effort apt_failed envelope on the same id if apt fails
+    // before postinst SIGTERMs the daemon. On apt success there is no
+    // follow-up envelope; the console waits for the next tick to
+    // observe daemon_version flipping to the new build instead.
     nlohmann::json HandleHostUpdate(const std::string& id,
                                     const nlohmann::json& payload);
     nlohmann::json HostResourcesPayload() const;

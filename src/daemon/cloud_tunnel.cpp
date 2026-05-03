@@ -869,9 +869,11 @@ void CloudTunnel::ThreadMain() {
                 HandleDeviceUnauthorized(message.value("payload", nlohmann::json::object()));
                 break;  // Reconnect; a rejected token may now need a pair code.
             }
-            // host.update returns a null sentinel when it has spawned a
-            // worker thread that will SendJson(reply) on its own once
-            // apt finishes. Anything else we send right here.
+            // Most handlers return a reply envelope here. host.update
+            // also returns one (a synchronous "accepted" ack) but
+            // additionally spawns a worker thread that may push a
+            // best-effort apt-failure envelope later on the same id
+            // — see HandleHostUpdate for the full rationale.
             auto reply = HandleRequest(message);
             if (!reply.is_null()) {
                 SendJson(std::move(reply));
@@ -1253,77 +1255,69 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
     const std::string target_version = payload.value("target_version", "");
     const std::string from_version = TENBOX_VERSION;
 
-    // Move the actual apt invocation off the reader thread so we don't
-    // freeze cloud command processing for the 10-30s an apt-get install
-    // typically takes. The worker writes the final reply on the same
-    // envelope id once apt returns, then exits; deb-systemd-invoke
-    // restart (run from postinst inside apt) SIGTERMs the daemon
-    // shortly afterwards. Sending BEFORE the SIGTERM is what guarantees
-    // the cloud sees the success message.
     const std::string log_path =
         (std::filesystem::path(config_.data_dir) / "logs" / "update.log").string();
     std::error_code ec;
     std::filesystem::create_directories(
         std::filesystem::path(log_path).parent_path(), ec);
 
+    // Fire-and-forget: kick apt on a worker thread and return an
+    // "accepted" envelope immediately. We deliberately do NOT try to
+    // send the final apt result back over this same envelope id:
+    //
+    //   - On success, apt's postinst calls `deb-systemd-invoke restart
+    //     tenboxd`, which SIGTERMs this very process. Any SendJson the
+    //     worker tries to do after pclose() is racing the kernel and
+    //     loses often enough in practice (see "stuck on 升级中" reports)
+    //     that we shouldn't pretend it's reliable.
+    //   - On failure, the daemon stays alive but the console no longer
+    //     waits for our reply (it polls daemon_version via tick instead
+    //     and times out at 90s). We still push a best-effort error
+    //     envelope so an attentive operator sees the apt log faster
+    //     than the timeout.
+    //
+    // The authoritative success signal is the next host tick reporting
+    // the new daemon_version after systemd restarts us.
     std::thread([this, id, target_version, from_version, log_path]() {
         const auto result = host_updater::RunAptUpgrade(target_version, log_path);
+        // If apt succeeded we're about to be SIGTERM'd by postinst's
+        // `systemctl restart`; trying to SendJson here is best-effort
+        // at most. The console relies on daemon_version flipping in
+        // the next tick instead.
+        if (result.ok && result.error.empty()) return;
+
         nlohmann::json body;
         if (!result.error.empty()) {
             body = Error("apt_failed",
                          "apt invocation failed before exit: " + result.error);
-            body["apt_log"] = result.log_tail;
-            body["apt_exit_code"] = result.exit_code;
-        } else if (!result.ok) {
+        } else {
             body = Error("apt_failed",
                          "apt-get install --only-upgrade tenbox exited "
                          + std::to_string(result.exit_code));
-            body["apt_log"] = result.log_tail;
-            body["apt_exit_code"] = result.exit_code;
-        } else {
-            // Ok payload: from / to / restart_pending. The cloud relies
-            // on `to` to decide which version to wait for in the post-
-            // upgrade poll loop.
-            const std::string installed = result.installed_version;
-            if (installed == from_version) {
-                auto err = Error("version_unchanged",
-                                 "apt reported success but installed version did not change");
-                err["from"] = from_version;
-                err["installed"] = installed;
-                err["apt_log"] = result.log_tail;
-                body = std::move(err);
-            } else if (!target_version.empty() && installed != target_version) {
-                auto err = Error("target_mismatch",
-                                 "installed version does not match requested target");
-                err["from"] = from_version;
-                err["installed"] = installed;
-                err["requested"] = target_version;
-                err["apt_log"] = result.log_tail;
-                body = std::move(err);
-            } else {
-                body = Ok({
-                    {"from", from_version},
-                    {"to", installed},
-                    {"restart_pending", true},
-                });
-            }
         }
+        body["apt_log"] = result.log_tail;
+        body["apt_exit_code"] = result.exit_code;
+        body["from"] = from_version;
+        if (!target_version.empty()) body["requested"] = target_version;
+
         nlohmann::json envelope = {
             {"id", id},
             {"type", "host.update.response"},
             {"host_id", host_id_},
             {"payload", std::move(body)},
         };
-        // Plan §4 step 4: the reply MUST land on the wire before the
-        // postinst-triggered systemctl restart kills the process,
-        // otherwise the cloud sees a bare connection close instead of
-        // a structured success/failure. A short fsync-style flush is
-        // implied by SendJson taking send_mu_; once that returns the
-        // OS has the bytes.
         (void)SendJson(std::move(envelope));
     }).detach();
 
-    return nlohmann::json();  // null sentinel: dispatch loop skips send.
+    // Synchronous ack: tell the console "I've accepted the request and
+    // started apt; switch to polling daemon_version for the real
+    // outcome." Includes `to` so the console knows which version to
+    // expect in the post-restart tick.
+    return build_envelope(Ok({
+        {"accepted", true},
+        {"from", from_version},
+        {"to", target_version.empty() ? std::string() : target_version},
+    }));
 }
 
 nlohmann::json CloudTunnel::ImageListPayload() const {
