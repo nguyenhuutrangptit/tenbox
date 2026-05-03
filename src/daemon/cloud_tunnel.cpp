@@ -1231,15 +1231,25 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
         };
     };
 
+    const std::string target_version_preview = payload.value("target_version", "");
+    std::cerr << "[INFO] host.update: request received from=" << TENBOX_VERSION
+              << " target="
+              << (target_version_preview.empty() ? "<latest>" : target_version_preview)
+              << " (id=" << id << ")\n";
+
     // Strict refusal: any VM that is starting / running / stopping /
     // rebooting blocks the upgrade. Plan §4 + decision A: console
     // surfaces the names so the operator knows exactly what to stop.
     auto running = host_updater::CollectRunningVms(store_);
     if (!running.empty()) {
         nlohmann::json vms = nlohmann::json::array();
+        std::string names;
         for (const auto& vm : running) {
             vms.push_back({{"vm_id", vm.vm_id}, {"name", vm.name}, {"state", vm.state}});
+            if (!names.empty()) names += ", ";
+            names += (vm.name.empty() ? vm.vm_id : vm.name) + "(" + vm.state + ")";
         }
+        std::cerr << "[WARN] host.update: refused (vms_running): " << names << "\n";
         auto err = Error("vms_running", "one or more VMs are still active; stop them before upgrading");
         err["running_vms"] = std::move(vms);
         return build_envelope(std::move(err));
@@ -1249,10 +1259,12 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
     // upgrader must never touch a binary it doesn't own.
     const auto apt_status = host_updater::CheckAptManaged();
     if (!apt_status.ok) {
+        std::cerr << "[WARN] host.update: refused (update_disabled): "
+                  << apt_status.reason << "\n";
         return build_envelope(Error("update_disabled", apt_status.reason));
     }
 
-    const std::string target_version = payload.value("target_version", "");
+    const std::string target_version = target_version_preview;
     const std::string from_version = TENBOX_VERSION;
 
     const std::string log_path =
@@ -1279,18 +1291,35 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
     // The authoritative success signal is the next host tick reporting
     // the new daemon_version after systemd restarts us.
     std::thread([this, id, target_version, from_version, log_path]() {
+        std::cerr << "[INFO] host.update: starting apt-get install --only-upgrade tenbox"
+                  << (target_version.empty() ? "" : ("=" + target_version))
+                  << " (log=" << log_path << ")\n";
+        const auto started_at = std::chrono::steady_clock::now();
         const auto result = host_updater::RunAptUpgrade(target_version, log_path);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at).count();
+
         // If apt succeeded we're about to be SIGTERM'd by postinst's
         // `systemctl restart`; trying to SendJson here is best-effort
         // at most. The console relies on daemon_version flipping in
         // the next tick instead.
-        if (result.ok && result.error.empty()) return;
+        if (result.ok && result.error.empty()) {
+            std::cerr << "[INFO] host.update: apt completed ok in " << elapsed_ms
+                      << "ms; installed=" << result.installed_version
+                      << "; awaiting systemctl restart from postinst (SIGTERM expected shortly)\n";
+            return;
+        }
 
         nlohmann::json body;
         if (!result.error.empty()) {
+            std::cerr << "[ERROR] host.update: apt invocation failed before exit ("
+                      << elapsed_ms << "ms): " << result.error << "\n";
             body = Error("apt_failed",
                          "apt invocation failed before exit: " + result.error);
         } else {
+            std::cerr << "[ERROR] host.update: apt exited " << result.exit_code
+                      << " after " << elapsed_ms << "ms; see " << log_path
+                      << " for the full transcript\n";
             body = Error("apt_failed",
                          "apt-get install --only-upgrade tenbox exited "
                          + std::to_string(result.exit_code));
@@ -1308,6 +1337,9 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
         };
         (void)SendJson(std::move(envelope));
     }).detach();
+
+    std::cerr << "[INFO] host.update: accepted (id=" << id
+              << "); apt running on background thread, ack sent to cloud\n";
 
     // Synchronous ack: tell the console "I've accepted the request and
     // started apt; switch to polling daemon_version for the real
