@@ -1273,73 +1273,26 @@ nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
     std::filesystem::create_directories(
         std::filesystem::path(log_path).parent_path(), ec);
 
-    // Fire-and-forget: kick apt on a worker thread and return an
-    // "accepted" envelope immediately. We deliberately do NOT try to
-    // send the final apt result back over this same envelope id:
-    //
-    //   - On success, apt's postinst calls `deb-systemd-invoke restart
-    //     tenboxd`, which SIGTERMs this very process. Any SendJson the
-    //     worker tries to do after pclose() is racing the kernel and
-    //     loses often enough in practice (see "stuck on 升级中" reports)
-    //     that we shouldn't pretend it's reliable.
-    //   - On failure, the daemon stays alive but the console no longer
-    //     waits for our reply (it polls daemon_version via tick instead
-    //     and times out at 90s). We still push a best-effort error
-    //     envelope so an attentive operator sees the apt log faster
-    //     than the timeout.
-    //
-    // The authoritative success signal is the next host tick reporting
-    // the new daemon_version after systemd restarts us.
-    std::thread([this, id, target_version, from_version, log_path]() {
-        std::cerr << "[INFO] host.update: starting apt-get install --only-upgrade tenbox"
-                  << (target_version.empty() ? "" : ("=" + target_version))
-                  << " (log=" << log_path << ")\n";
-        const auto started_at = std::chrono::steady_clock::now();
-        const auto result = host_updater::RunAptUpgrade(target_version, log_path);
-        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started_at).count();
-
-        // If apt succeeded we're about to be SIGTERM'd by postinst's
-        // `systemctl restart`; trying to SendJson here is best-effort
-        // at most. The console relies on daemon_version flipping in
-        // the next tick instead.
-        if (result.ok && result.error.empty()) {
-            std::cerr << "[INFO] host.update: apt completed ok in " << elapsed_ms
-                      << "ms; installed=" << result.installed_version
-                      << "; awaiting systemctl restart from postinst (SIGTERM expected shortly)\n";
-            return;
-        }
-
-        nlohmann::json body;
-        if (!result.error.empty()) {
-            std::cerr << "[ERROR] host.update: apt invocation failed before exit ("
-                      << elapsed_ms << "ms): " << result.error << "\n";
-            body = Error("apt_failed",
-                         "apt invocation failed before exit: " + result.error);
-        } else {
-            std::cerr << "[ERROR] host.update: apt exited " << result.exit_code
-                      << " after " << elapsed_ms << "ms; see " << log_path
-                      << " for the full transcript\n";
-            body = Error("apt_failed",
-                         "apt-get install --only-upgrade tenbox exited "
-                         + std::to_string(result.exit_code));
-        }
-        body["apt_log"] = result.log_tail;
-        body["apt_exit_code"] = result.exit_code;
-        body["from"] = from_version;
-        if (!target_version.empty()) body["requested"] = target_version;
-
-        nlohmann::json envelope = {
-            {"id", id},
-            {"type", "host.update.response"},
-            {"host_id", host_id_},
-            {"payload", std::move(body)},
-        };
-        (void)SendJson(std::move(envelope));
-    }).detach();
-
-    std::cerr << "[INFO] host.update: accepted (id=" << id
-              << "); apt running on background thread, ack sent to cloud\n";
+    // Spawn apt as a fully detached process living in its own systemd
+    // scope (see SpawnAptUpgrade for the cgroup rationale). The call
+    // is non-blocking: the daemon never waits for apt to finish, and
+    // the apt process survives our own SIGTERM. The cloud will learn
+    // the outcome by observing daemon_version in the next host tick
+    // after systemd restarts us; failure modes show up in
+    // /var/lib/tenbox/logs/update.log for operator inspection.
+    const auto spawn = host_updater::SpawnAptUpgrade(target_version, log_path);
+    if (!spawn.ok) {
+        std::cerr << "[ERROR] host.update: failed to spawn apt: "
+                  << spawn.error << "\n";
+        auto err = Error("apt_failed",
+                         "failed to spawn apt: " + spawn.error);
+        err["from"] = from_version;
+        if (!target_version.empty()) err["requested"] = target_version;
+        return build_envelope(std::move(err));
+    }
+    std::cerr << "[INFO] host.update: spawned apt in detached scope "
+              << "(wrapper pid=" << spawn.pid << ", log=" << log_path
+              << "); ack sent to cloud, awaiting daemon restart from postinst\n";
 
     // Synchronous ack: tell the console "I've accepted the request and
     // started apt; switch to polling daemon_version for the real

@@ -34,26 +34,33 @@ struct RunningVm {
 
 std::vector<RunningVm> CollectRunningVms(const VmStore& store);
 
-// Run `apt-get update && apt-get install --only-upgrade tenbox[=ver]`.
-// Streams stdout+stderr into `log_path` (truncated on each call) for
-// post-mortem inspection, also keeps the last `tail_max` bytes in
-// `log_tail`. Sets `installed_version` to the dpkg-reported version
-// after a successful install.
+// Spawn `apt-get update && apt-get install --only-upgrade tenbox[=ver]`
+// as a fully detached child (own session via setsid + closed stdio +
+// stdout/stderr redirected to `log_path`) and return immediately.
 //
-// Returns true iff the apt-get exit code was zero. `error` is filled on
-// any subprocess plumbing failure (fork, popen) before apt itself ran.
-struct AptResult {
-    bool ok = false;
-    int exit_code = -1;
-    std::string installed_version;
-    std::string log_tail;
-    std::string error;
+// Detachment is mandatory, not a nicety: when apt's postinst calls
+// `systemctl restart tenboxd`, systemd SIGTERMs the daemon. If apt
+// were a child of the daemon's process group, that signal would
+// cascade through the popen()'d shell and tear apt down mid-install,
+// leaving dpkg's status file half-written and the system stuck on
+// "dpkg was interrupted; you must run sudo dpkg --configure -a".
+// Detaching makes apt an immediate child of PID 1, so SIGTERM to the
+// daemon cannot reach it.
+//
+// Because the call returns before apt finishes, there is no exit code
+// to report. The authoritative outcome comes from the next host tick
+// reporting daemon_version after systemd restarts us; failures show
+// up in `log_path` and remain visible for operator inspection.
+struct AptSpawnResult {
+    bool ok = false;        // true iff fork+exec plumbing succeeded
+    pid_t pid = 0;          // detached apt PID, for journal logging
+    std::string log_path;   // echoed back; convenient for log lines
+    std::string error;      // populated when ok == false
 };
 
-AptResult RunAptUpgrade(
+AptSpawnResult SpawnAptUpgrade(
     const std::string& target_version,  // empty = "latest"
-    const std::string& log_path,
-    size_t tail_max = 4096);
+    const std::string& log_path);
 
 // Read /etc/os-release into a JSON object. Keys: id, version_id,
 // version_codename, pretty_name. Missing fields are absent (no empty

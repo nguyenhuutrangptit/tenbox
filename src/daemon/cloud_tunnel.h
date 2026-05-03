@@ -61,13 +61,14 @@ private:
     void HandleDeviceUnauthorized(const nlohmann::json& payload);
     nlohmann::json HandleRequest(const nlohmann::json& request);
     // Synchronous response is one of:
-    //   - vms_running / update_disabled error envelope (rejected),
-    //   - {ok:true, accepted:true, from, to} ack (apt worker spawned).
-    // On the ack path the spawned worker may additionally push a
-    // best-effort apt_failed envelope on the same id if apt fails
-    // before postinst SIGTERMs the daemon. On apt success there is no
-    // follow-up envelope; the console waits for the next tick to
-    // observe daemon_version flipping to the new build instead.
+    //   - vms_running / update_disabled / apt_failed error envelope
+    //     (rejected before apt got a chance to run),
+    //   - {ok:true, accepted:true, from, to} ack (apt detached into
+    //     a systemd transient scope; daemon will not see it again).
+    // There is no follow-up envelope on this id: the apt process
+    // lives in its own cgroup and the daemon may be SIGTERM'd by
+    // postinst before apt finishes anyway. The console learns the
+    // outcome by polling daemon_version in subsequent host ticks.
     nlohmann::json HandleHostUpdate(const std::string& id,
                                     const nlohmann::json& payload);
     nlohmann::json HostResourcesPayload() const;
