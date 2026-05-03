@@ -2172,9 +2172,14 @@ nlohmann::json CloudTunnel::VmResourcesSnapshot() const {
     nlohmann::json vms = nlohmann::json::array();
     for (const auto& vm : store_.List()) {
         if (vm.runtime.state != VmState::kRunning || vm.runtime.pid <= 0) continue;
+        // Deliberately omit `state` here. This payload is a sparse
+        // metrics sample of currently-running VMs; lifecycle state is
+        // pushed authoritatively via vm.state_changed. Including
+        // `state` once tempted consumers to treat the tick as a list
+        // snapshot and ended up flashing stopped VMs as "running"
+        // whenever the cloud relay replayed a stale cached tick.
         vms.push_back({
             {"vm_id", vm.spec.vm_id},
-            {"state", VmStateToString(vm.runtime.state)},
             {"pid", vm.runtime.pid},
             {"resources", {
                 {"disk_usage_bytes", CachedDirectorySizeBytes(vm.spec.vm_dir)},
