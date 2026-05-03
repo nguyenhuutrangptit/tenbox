@@ -283,12 +283,21 @@ AptSpawnResult SpawnAptUpgrade(const std::string& target_version,
         // exec systemd-run, which moves us into a fresh transient
         // scope cgroup before exec-ing /bin/sh. Once we're in the new
         // cgroup, `systemctl restart tenboxd` can no longer reach us.
+        //
+        // CRITICAL: `--setenv` must be a single argv of the form
+        // `--setenv=KEY=VALUE` (or `--setenv KEY=VALUE` as two argvs).
+        // An earlier version split it as `--setenv=LOG` + `<path>`,
+        // which made systemd-run treat the path as the command to
+        // exec; the scope spun up and died in the same millisecond
+        // ("Deactivated successfully"), the log file stayed empty,
+        // and no upgrade ever ran. Build the env arg as one string.
+        const std::string log_env = std::string("--setenv=LOG=") + log_path;
         const char* argv[] = {
             "systemd-run",
             "--scope",
             "--collect",
             "--quiet",
-            "--setenv=LOG", log_path.c_str(),
+            log_env.c_str(),
             "/bin/sh", "-c", script.c_str(),
             nullptr,
         };
