@@ -81,6 +81,15 @@ ARG OPUS_VERSION=1.5.2
 # static archive bit-for-bit reproducible across runs.
 ARG LIBYUV_REF=b438739c8b08eba2c562a62ea5961f6215d525ed
 ARG FFMPEG_VERSION=6.1.1
+# nv-codec-headers: header-only stubs for the NVENC/NVDEC SDK. FFmpeg
+# uses dlopen at runtime to load the actual NVIDIA driver libraries
+# (libnvidia-encode.so.1), so no GPU or CUDA toolkit is needed at build
+# time — only these headers.
+# Pin to the SDK 11.1 line: FFmpeg 6.1.x's nvenc.c uses the _PL buffer
+# format names (NV_ENC_BUFFER_FORMAT_NV12_PL etc.) which were removed in
+# SDK 12.0. Using 12.x headers here causes compile errors against FFmpeg
+# 6.1.1. If FFmpeg is ever bumped to 7.x this can be updated to 12.x.
+ARG NV_CODEC_HEADERS_VERSION=11.1.5.3
 ARG CURL_VERSION=8.10.1
 # OpenSSL 3.0 is the LTS line (security support through 2026-09).
 # Static-linking it means the deb no longer needs libssl3/libssl3t64 in
@@ -152,8 +161,22 @@ RUN git clone https://chromium.googlesource.com/libyuv/libyuv \
     && cmake --build libyuv/build --target install \
     && rm -rf libyuv
 
+# nv-codec-headers (MIT): header-only NVENC/NVDEC SDK stubs. Install
+# before FFmpeg so ./configure detects ffnvcodec and enables h264_nvenc.
+# FFmpeg dlopen()s libnvidia-encode.so.1 at runtime; no GPU or CUDA
+# toolkit is required here in the build container.
+RUN curl -fsSL "https://github.com/FFmpeg/nv-codec-headers/releases/download/n${NV_CODEC_HEADERS_VERSION}/nv-codec-headers-${NV_CODEC_HEADERS_VERSION}.tar.gz" \
+        | tar xz \
+    && cd nv-codec-headers-${NV_CODEC_HEADERS_VERSION} \
+    && make install PREFIX=$DEPS_PREFIX \
+    && cd .. && rm -rf nv-codec-headers-${NV_CODEC_HEADERS_VERSION}
+
 # FFmpeg: only the codecs tenbox actually uses (libx264 encode, h264
-# decode, libopus encode/decode). everything else off, static-only.
+# decode, libopus encode/decode, h264_nvenc hardware encode).
+# h264_nvenc is compiled in via ffnvcodec (header-only at build time);
+# the actual libnvidia-encode.so.1 is dlopen'd at runtime on hosts that
+# have an NVIDIA driver installed. On hosts without a GPU the codec is
+# silently unavailable and tenboxd falls back to libx264.
 RUN curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
         | tar xJ \
     && cd ffmpeg-${FFMPEG_VERSION} \
@@ -171,7 +194,9 @@ RUN curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
         --enable-muxer=null --enable-demuxer=null \
         --enable-encoder=libx264 --enable-decoder=h264 \
         --enable-encoder=libopus --enable-decoder=opus \
+        --enable-encoder=h264_nvenc \
         --enable-libx264 --enable-libopus \
+        --enable-ffnvcodec \
         --enable-gpl \
     && make -j"$(nproc)" \
     && make install \
