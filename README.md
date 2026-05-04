@@ -1,8 +1,17 @@
 # TenBox
 
-TenBox lets you run AI agents safely on your personal computer. Each agent runs inside a secure, isolated virtual machine — it can only access the files you explicitly authorize, keeping your privacy and data protected.
+TenBox lets you run AI agents safely on your personal computer. Each agent runs
+inside a secure, isolated virtual machine — it can only access the files you
+explicitly authorize, keeping your privacy and data protected.
 
-Under the hood, TenBox is a cross-platform Virtual Machine Monitor (VMM) with a shared C++ runtime. It runs full Linux desktop environments with hardware-accelerated virtualization, GPU display output, audio, shared folders, and clipboard integration. Windows hosts use WHVP with a Win32 manager; macOS hosts use Hypervisor Framework (both Apple Silicon and Intel) with a SwiftUI/AppKit manager; Linux hosts run the VM runtime directly on KVM for both x86_64 PCs and arm64 boards (e.g. Raspberry Pi).
+Under the hood, TenBox is a cross-platform Virtual Machine Monitor (VMM) with a
+shared C++ runtime. It runs full Linux desktop environments with
+hardware-accelerated virtualization, GPU display output, audio, shared folders,
+and clipboard integration. Windows hosts use WHVP with a Win32 manager; macOS
+hosts use Hypervisor Framework (both Apple Silicon and Intel) with a
+SwiftUI/AppKit manager; Linux hosts run `tenboxd`, a systemd daemon that manages
+VM lifecycle, exposes a local CLI, and provides optional browser-based remote
+desktop.
 
 ## Screenshots
 
@@ -20,7 +29,9 @@ Under the hood, TenBox is a cross-platform Virtual Machine Monitor (VMM) with a 
 ## Features
 
 - **Cross-platform hypervisor backends** — WHVP on Windows, Hypervisor Framework on macOS (Apple Silicon and Intel), KVM on Linux (x86_64 and arm64, including Raspberry Pi)
-- **Native GUI managers** — Win32 manager on Windows, SwiftUI/AppKit manager on macOS (Linux hosts currently run the VM runtime CLI headlessly)
+- **Native GUI managers** — Win32 on Windows, SwiftUI/AppKit on macOS
+- **Linux daemon (`tenboxd`)** — systemd-managed, local RPC over `/run/tenbox/tenbox.sock`, `tenbox` system group access control
+- **`tenbox` CLI** — `doctor` / `system info` / `vm ls|create|edit|start|stop|reboot|shutdown|rm|console|logs`
 - **Linux boot support** — boots standard `vmlinuz` / `Image` kernels with `initramfs`
 - **VirtIO MMIO devices** — block, network, GPU, input, serial, sound, and filesystem
 - **qcow2 & raw disk images** — zlib and zstd compressed cluster support, copy-on-write
@@ -28,12 +39,14 @@ Under the hood, TenBox is a cross-platform Virtual Machine Monitor (VMM) with a 
 - **Audio output** — virtio-snd streamed to host via WASAPI on Windows and CoreAudio on macOS
 - **Shared folders** — virtiofs (virtio-fs), configurable per VM with optional read-only mode
 - **Clipboard sharing** — bidirectional host ↔ guest clipboard via SPICE vdagent protocol
-- **Guest agent** — qemu-guest-agent integration for VM lifecycle management
+- **Guest agent** — qemu-guest-agent integration for VM lifecycle management (graceful reboot/shutdown)
 - **NAT networking** — built-in DHCP server, TCP/UDP NAT proxy, ICMP relay via lwIP
 - **Port forwarding** — host-forward (expose guest TCP services on host ports) and guest-forward (route guest traffic to host services)
 - **Multi-VM management** — create, edit, start, stop, reboot, and delete VMs; config persisted as `vm.json`
-- **Platform-specific machine models** — shared VMM core with x86_64 (Local APIC / I/O APIC) and aarch64 (GICv3) guest support
-- **LLM proxy** — built-in OpenAI-compatible HTTP proxy that maps guest requests to configurable upstream providers, with per-request logging
+- **Platform-specific machine models** — x86_64 (Local APIC / I/O APIC) and aarch64 (GICv3) guest support
+- **Browser remote desktop (Linux)** — daemon-embedded libdatachannel + FFmpeg H.264 (high/baseline) + Opus; dual `input-fast` / `control` DataChannels; bidirectional clipboard
+- **Cloud pairing & self-update (Linux)** — 8-digit pairing code → `https://my.tenbox.ai/pair`; daemon accepts `host.update` and runs `apt-get install --only-upgrade tenbox` in-place
+- **LLM proxy** — built-in OpenAI-compatible HTTP proxy mapping guest requests to configurable upstream providers; available in `tenboxd` on Linux and the GUI manager on Windows/macOS
 
 ## Install
 
@@ -44,323 +57,25 @@ curl -fsSL https://tenbox.ai/install.sh | sudo sh
 ```
 
 Requires glibc 2.31+ and `/dev/kvm`. The installer registers the TenBox apt
-repo, installs the `tenbox` deb, and enables `tenboxd.service`. After install,
-a pairing URL is printed to journalctl — open it (or visit
-https://my.tenbox.ai/) to claim the host. Tested on x86_64 PCs and Raspberry
-Pi 5; other arm64 boards may work but are not yet validated.
+repo, installs the `tenbox` deb, adds the current user to the `tenbox` group,
+and enables `tenboxd.service`. After install, a pairing URL is printed to the
+terminal — open it (or visit `https://my.tenbox.ai/`) to claim the host.
+Tested on x86_64 PCs and Raspberry Pi 5; other arm64 boards may work but are
+not yet validated.
 
 ### Windows / macOS
 
 Download the latest installer from [tenbox.ai](https://tenbox.ai/) or the
 [GitHub Releases](https://github.com/78/tenbox/releases) page.
 
-## Build from source
-
-### Prerequisites
-
-#### Windows
-
-- Windows 10/11 with **Windows Hypervisor Platform** enabled
-- Visual Studio 2022+ with C++20 support
-- CMake 3.21+
-- WSL2 or a Linux environment (for building disk images)
-
-#### macOS
-
-- macOS 13+ on **Apple Silicon** (arm64) or **Intel** (x86_64)
-- Xcode 15+ or Xcode Command Line Tools with Swift 5.9+
-- CMake 3.21+
-- Docker (recommended for building guest images)
-
-#### Linux (VM runtime only)
-
-- A Linux host with `/dev/kvm` available to the current user (group `kvm` on most distros)
-- x86_64 or arm64 (validated on Raspberry Pi 5 with a 64-bit OS; other arm64 boards may work but are not yet validated)
-- GCC 12+ / Clang 15+ with C++20 support
-- CMake 3.21+
-- Docker (recommended for building guest images)
-
-Note: there is no native Linux GUI manager. On Linux, only `tenbox-vm-runtime` is built — start VMs via its CLI (see the VM Runtime CLI section below).
-
-### Build
-
-#### Windows
-
-```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-This produces the Windows binaries in `build/`:
-
-
-| Executable              | Description                                  |
-| ----------------------- | -------------------------------------------- |
-| `tenbox-manager.exe`    | GUI manager — the main entry point           |
-| `tenbox-vm-runtime.exe` | VM runtime process — launched by the manager |
-
-
-#### macOS
-
-```bash
-./scripts/build-macos.sh --release
-```
-
-This produces the macOS artifacts in `build/`:
-
-
-| Artifact                      | Description                                      |
-| ----------------------------- | ------------------------------------------------ |
-| `TenBox.app`                  | Native macOS manager application bundle          |
-| `tenbox-vm-runtime`           | VM runtime process bundled into the app          |
-| `TenBox_<version>_<arch>.zip` | Sparkle update ZIP generated by the build script |
-
-
-#### Linux
-
-```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-This produces `build/tenbox-vm-runtime` (the KVM-backed runtime). There is no `tenbox-manager` on Linux — launch VMs via the CLI documented in [VM Runtime CLI](#vm-runtime-cli).
-
-### Prepare VM Images
-
-Use the Docker wrapper to build images (requires Docker). Several rootfs flavors are available — `chromium`, `openclaw`, `qwenpaw`, and `hermes`:
-
-```bash
-# x86_64 images
-./scripts/docker/build.sh x86_64 kernel
-./scripts/docker/build.sh x86_64 initramfs
-./scripts/docker/build.sh x86_64 rootfs-chromium   # or rootfs-openclaw / rootfs-qwenpaw / rootfs-hermes
-
-# arm64 images (for macOS Apple Silicon)
-./scripts/docker/build.sh arm64 kernel
-./scripts/docker/build.sh arm64 initramfs
-./scripts/docker/build.sh arm64 rootfs-chromium    # or rootfs-openclaw / rootfs-qwenpaw / rootfs-hermes
-```
-
-The rootfs scripts support incremental builds with a checkpoint system. If interrupted, re-run the same command to resume:
-
-```bash
-./scripts/docker/build.sh x86_64 rootfs-chromium --status       # Show build progress
-./scripts/docker/build.sh x86_64 rootfs-chromium --list-steps   # List all build steps
-./scripts/docker/build.sh x86_64 rootfs-chromium --force        # Force full rebuild
-```
-
-### Run
-
-On Windows and macOS, launch the native manager for your host platform and use the GUI to create and start VMs:
-
-```bash
-# Windows
-build/tenbox-manager.exe
-
-# macOS
-open build/TenBox.app
-```
-
-On Linux, launch the runtime directly:
-
-```bash
-# Linux (x86_64 PC or arm64, e.g. Raspberry Pi)
-build/tenbox-vm-runtime --kernel build/Image --initrd build/initramfs-<arch>.cpio.gz \
-    --disk build/rootfs.qcow2 --net
-```
-
-If you are building guest images yourself, match the architecture to the host: use the `x86_64` image scripts on Windows and Intel macOS / Linux PCs, and the `arm64` image scripts on Apple Silicon macOS and arm64 Linux boards.
-
-To create a VM through the GUI (Windows/macOS), click **New VM** and point to the kernel, initramfs, and disk image files built above.
-
-## User guide
-
-Usage documentation (Chinese): **[养虾教程](https://my.feishu.cn/wiki/Q96KwUH1Di3cAik2W7kcQsWKncb)** (Feishu Wiki).
-
-Guest images built with the Chromium, OpenClaw, QwenPaw, and Hermes rootfs scripts also install a desktop shortcut `**Help.desktop`** that opens the same page (source: `[scripts/rootfs-configs/Help.desktop](scripts/rootfs-configs/Help.desktop)`).
-
-## Architecture
-
-TenBox uses a two-process design. The manager process owns the UI and spawns a separate runtime process for each VM. They communicate over a platform-specific IPC transport: Windows Named Pipes on Windows and Unix domain sockets on macOS.
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  tenbox-manager.exe / TenBox.app                                 │
-│                                                                  │
-│  Native manager UI                                               │
-│  ├─ Windows: Win32 manager (`src/manager/`)                      │
-│  ├─ macOS: SwiftUI/AppKit manager (`src/manager-macos/`)         │
-│  ├─ VM list, create/edit flows, display, console                 │
-│  ├─ Clipboard bridge, shared folders, audio playback             │
-│  └─ Settings, image sources, downloads, update checks            │
-│                  │ IPC protocol v1                               │
-│                  │ Windows: Named Pipe                           │
-│                  │ macOS: Unix domain socket                     │
-│                  ▼                                               │
-│  tenbox-vm-runtime  [one per running VM]                         │
-│  ├─ Host backend: WHVP (Windows) / HVF (macOS) / KVM (Linux)     │
-│  ├─ Guest machine model: x86_64 / aarch64                        │
-│  ├─ Address space (PIO / MMIO)                                   │
-│  ├─ Platform devices and machine glue for x86_64 / aarch64       │
-│  ├─ VirtIO MMIO: blk · net · gpu · input · serial · snd · fs    │
-│  ├─ vdagent handler (clipboard)                                  │
-│  ├─ guest_agent handler                                          │
-│  └─ Net backend: lwIP · DHCP · NAT · port forward               │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Source Layout
-
-```
-src/
-├── common/              # Shared types: VmSpec, PortForward, SharedFolder, port helpers
-├── core/                # VM engine
-│   ├── arch/
-│   │   ├── x86_64/      # x86_64 machine model, Linux boot protocol, ACPI
-│   │   └── aarch64/     # arm64 machine model, boot flow, FDT
-│   ├── device/
-│   │   ├── serial/      # UART 16550
-│   │   ├── timer/       # i8254 PIT
-│   │   ├── rtc/         # CMOS RTC
-│   │   ├── irq/         # x86 Local APIC / I/O APIC / i8259 PIC, aarch64 GICv3
-│   │   ├── acpi/        # ACPI PM registers
-│   │   ├── pci/         # PCI host bridge
-│   │   └── virtio/      # VirtIO MMIO + blk/net/gpu/input/serial/snd/fs
-│   ├── disk/            # qcow2 / raw disk image backends, qcow2 consistency checker
-│   ├── guest_agent/     # qemu-guest-agent protocol handler
-│   ├── net/             # lwIP NAT backend (DHCP, NAT, ICMP, port-forward)
-│   ├── util/            # Shared utilities (high-resolution timer: Win / mach / libuv)
-│   ├── vdagent/         # SPICE vdagent (clipboard protocol)
-│   └── vmm/             # VM orchestration, address space & hypervisor interface
-│       ├── hypervisor_vm.h    # Abstract HypervisorVm interface
-│       └── hypervisor_vcpu.h  # Abstract HypervisorVCpu interface
-├── platform/            # OS-specific implementations
-│   ├── windows/
-│   │   ├── hypervisor/  # WHVP (Windows Hypervisor Platform)
-│   │   ├── console/     # StdConsolePort (Win32 console I/O)
-│   │   └── ipc/         # Win32 shared framebuffer backend
-│   ├── macos/
-│   │   └── hypervisor/  # HVF (Hypervisor Framework) — x86_64 and aarch64 backends
-│   ├── linux/
-│   │   └── hypervisor/  # KVM backend — x86_64 and aarch64 (incl. Raspberry Pi)
-│   └── posix/
-│       └── console/     # PosixConsolePort (shared by macOS and Linux)
-├── ipc/                 # Shared IPC protocol v1 and POSIX transport (Unix socket, shared framebuffer).
-│                        # Windows Named Pipe transport lives inline in src/manager/manager_service.cpp
-├── manager/             # Windows GUI manager application
-│   ├── main.cpp               # Win32 GUI entry point
-│   ├── ui/              # Win32 GUI: shell, display, dialogs, tabs, LLM proxy dialog
-│   ├── audio/           # WASAPI audio player
-│   ├── resources/       # App icons and resource files
-│   ├── llm_proxy.{h,cpp}      # OpenAI-compatible HTTP proxy for guest LLM traffic
-│   ├── manager_service.{h,cpp}# Core manager service (VM lifecycle, IPC incl. Named Pipe, state)
-│   ├── app_settings.{h,cpp}   # Persisted app settings (LLM proxy, UI prefs, etc.)
-│   ├── image_source.{h,cpp}   # Remote image catalog
-│   ├── http_download.{h,cpp}  # HTTP(S) downloader
-│   ├── i18n.{h,cpp}           # Localized strings
-│   └── vm_forms.{h,cpp}       # VM create/edit form helpers
-├── manager-macos/       # macOS manager (SwiftUI/AppKit + Obj-C++ bridge)
-│   ├── Views/           # SwiftUI screens, display views, LLM proxy view
-│   ├── Services/        # Image source service, LLM proxy service
-│   ├── Bridge/          # Swift <-> C++/Obj-C++ IPC and VM process bridge
-│   ├── Input/           # Keyboard / pointer capture handlers
-│   ├── Audio/           # CoreAudio playback
-│   ├── Clipboard/       # Host clipboard integration
-│   └── Resources/       # App bundle resources, entitlements, shaders
-└── runtime/             # VM runtime process
-    ├── main.cpp               # CLI entry point and argv parsing
-    ├── runtime_service.{h,cpp}# Control channel to the manager (IPC, state, ports)
-    └── crash_handler.{h,cpp}  # Minidump / backtrace capture into <vm-dir>/crash
-scripts/
-├── x86_64/              # x86_64 image build scripts (kernel, initramfs, rootfs-*)
-├── arm64/               # arm64 image build scripts (kernel, initramfs, rootfs-*)
-├── docker/              # Dockerfile & build.sh wrapper
-├── rootfs-scripts/      # In-chroot setup scripts (shared)
-├── rootfs-services/     # systemd service units (shared)
-├── rootfs-configs/      # Shared guest files (e.g. Help.desktop wiki shortcut)
-├── ci/                  # CI helpers (image manifest updates, OSS upload)
-├── requirements.txt     # Python dependencies for release tooling
-├── image_manager.py     # Image source management helper
-├── build-macos.sh       # Build macOS app bundle and update ZIP
-├── make-dmg.sh          # Create signed macOS DMG
-└── mkcpio.py            # CPIO archive generator (shared)
-```
-
-### Networking
-
-When NAT is enabled, TenBox provides a user-mode network:
-
-
-| Address     | Role                |
-| ----------- | ------------------- |
-| `10.0.2.2`  | Gateway (host)      |
-| `10.0.2.15` | Guest IP (via DHCP) |
-| `8.8.8.8`   | DNS server          |
-
-
-- **Outbound TCP** — proxied through the lwIP TCP stack to host sockets
-- **Outbound UDP** — directly relayed by the host networking layer (DNS, NTP, etc.)
-- **ICMP** — relayed via raw socket where supported by the host OS and permissions
-- **Port forwarding** — configurable per VM; e.g., host port 2222 → guest port 22
-
-### Guest Defaults (built by `scripts/*/make-rootfs-chromium.sh`)
-
-
-| Setting       | Default                                   | Override                              |
-| ------------- | ----------------------------------------- | ------------------------------------- |
-| Root password | `tenbox`                                  | `ROOT_PASSWORD` env var               |
-| User account  | `tenbox` / `tenbox`                       | `USER_NAME` / `USER_PASSWORD` env var |
-| Hostname      | `tenbox-vm`                               | —                                     |
-| Desktop       | XFCE 4 (LightDM)                          | —                                     |
-| Disk size     | 100 GB qcow2                              | `ROOTFS_SIZE` variable                |
-| Distro        | Debian Trixie                             | —                                     |
-| Pre-installed | Chromium, SPICE vdagent, qemu-guest-agent | —                                     |
-
-
-## VM Runtime CLI
-
-The runtime is normally launched by the manager, but can also be invoked directly. On Windows the binary is `tenbox-vm-runtime.exe`; on macOS it is `tenbox-vm-runtime`.
-
-```bash
-build/tenbox-vm-runtime --kernel build/Image --initrd build/initramfs-x86_64.cpio.gz \
-    --disk build/rootfs.qcow2 --net
-```
-
-
-| Option                      | Description                                                                                                                  |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `--kernel <path>`           | Path to Linux kernel image such as `vmlinuz` or `Image` **(required)**                                                       |
-| `--initrd <path>`           | Path to initramfs                                                                                                            |
-| `--disk <path>`             | Path to raw or qcow2 disk image                                                                                              |
-| `--cmdline <str>`           | Kernel command line                                                                                                          |
-| `--memory <MB>`             | Guest RAM in MB (default: 256, minimum: 16)                                                                                  |
-| `--cpus <N>`                | Number of vCPUs (default: 1, max: 128)                                                                                       |
-| `--net`                     | Start with virtio-net link up (default: link down)                                                                           |
-| `--debug`                   | Enable debug mode (verbose kernel output)                                                                                    |
-| `--hostfwd <spec>`          | Host-to-guest port forward (repeatable), e.g. `tcp:127.0.0.1:8080-:80` (loopback) or `tcp:0.0.0.0:8080-:80` (LAN-accessible) |
-| `--guestfwd <spec>`         | Guest-to-host forward (repeatable), e.g. `guestfwd:10.0.2.3:80-:18981` or `guestfwd:10.0.2.3:80-127.0.0.1:18981`             |
-| `--share TAG:PATH[:ro]`     | Share a host directory via virtiofs (repeatable)                                                                             |
-| `--interactive on           | off`                                                                                                                         |
-| `--vm-id <id>`              | VM instance identifier (default: `default`)                                                                                  |
-| `--vm-dir <path>`           | VM working directory; crash dumps are written under `<vm-dir>/crash`                                                         |
-| `--control-endpoint <name>` | IPC endpoint for manager communication: named pipe name on Windows (without `\\.\pipe\` prefix), Unix socket path on macOS   |
-| `--version`, `-v`           | Show version and exit                                                                                                        |
-| `--help`, `-h`              | Show help and exit                                                                                                           |
-
-
-## Dependencies
-
-Fetched automatically by the build system:
-
-
-| Library                                               | Use                                                    |
-| ----------------------------------------------------- | ------------------------------------------------------ |
-| [zlib](https://github.com/madler/zlib)                | qcow2 zlib compressed cluster decompression            |
-| [zstd](https://github.com/facebook/zstd)              | qcow2 zstd compressed cluster decompression            |
-| [lwIP](https://github.com/lwip-tcpip/lwip)            | Lightweight TCP/IP stack for NAT networking            |
-| [nlohmann/json](https://github.com/nlohmann/json)     | VM manifest (`vm.json`) serialization                  |
-| [Sparkle](https://github.com/sparkle-project/Sparkle) | macOS app update framework used by `src/manager-macos` |
-
+## Documentation
+
+- **User guide** (Chinese): **[养虾教程](https://my.feishu.cn/wiki/Q96KwUH1Di3cAik2W7kcQsWKncb)** (Feishu Wiki)
+- **Build from source**: [docs/build.md](docs/build.md)
+- **Daemon architecture (Linux)**: [docs/tenboxd.md](docs/tenboxd.md)
+- **CLI reference**: [docs/cli.md](docs/cli.md)
+- **Release process**: [docs/release.md](docs/release.md)
+- **Linux update path**: [docs/linux-update.md](docs/linux-update.md)
 
 ## License
 
