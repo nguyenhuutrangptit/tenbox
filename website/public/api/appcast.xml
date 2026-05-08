@@ -6,22 +6,22 @@
     <description>TenBox Updates</description>
     <language>zh-CN</language>
     <item>
-      <title>Version 0.7.7</title>
+      <title>Version 0.8.0</title>
       <description><![CDATA[
         <ul>
-          <li>- 增加系统托盘</li>
+          <li>- 修复若干bug</li>
           <li>- 重要‼ 0.5.7 之前版本，请在升级前确保已备份虚拟机内的重要数据</li>
         </ul>
       ]]></description>
-      <pubDate>Tue, 28 Apr 2026 00:00:00 -0000</pubDate>
+      <pubDate>Fri, 08 May 2026 00:00:00 -0000</pubDate>
       <sparkle:minimumSystemVersion>10</sparkle:minimumSystemVersion>
       <enclosure
-        url="https://files.xiaozhi.me/tenbox/releases/TenBox_0.7.7.msi"
+        url="https://files.xiaozhi.me/tenbox/releases/TenBox_0.8.0.msi"
         sparkle:os="windows"
-        sparkle:version="0.7.7"
-        sparkle:shortVersionString="0.7.7"
+        sparkle:version="0.8.0"
+        sparkle:shortVersionString="0.8.0"
         sparkle:installerArguments="/passive"
-        length="3272704"
+        length="3280896"
         type="application/octet-stream"
       />
     </item>
