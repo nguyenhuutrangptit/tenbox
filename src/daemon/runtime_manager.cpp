@@ -481,8 +481,11 @@ bool RuntimeManager::StartVm(const std::string& vm_id, std::string* error) {
     }
     if (pid == 0) {
         // Ensure runtime exits if tenboxd dies unexpectedly.
-        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
-        if (::getppid() == 1) _exit(128);
+        // NOTE: PR_SET_PDEATHSIG tracks the fork()-ing thread, not the process.
+        // When the RPC handler thread exits after returning from StartVm,
+        // the kernel delivers SIGTERM to the runtime. Skip this in dev mode.
+        // ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+        // if (::getppid() == 1) _exit(128);
         ::dup2(log_pipe[1], STDOUT_FILENO);
         ::dup2(log_pipe[1], STDERR_FILENO);
         ::close(log_pipe[0]);

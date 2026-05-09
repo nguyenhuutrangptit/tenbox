@@ -68,6 +68,36 @@ not yet validated.
 Download the latest installer from [tenbox.ai](https://tenbox.ai/) or the
 [GitHub Releases](https://github.com/78/tenbox/releases) page.
 
+## Quick Start
+
+Build TenBox from source and run a Chromium desktop VM on Linux:
+
+```bash
+# 1. Build the application
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 2. Build VM images (requires Docker)
+./scripts/docker/build.sh x86_64 kernel
+./scripts/docker/build.sh x86_64 initramfs
+./scripts/docker/build.sh x86_64 rootfs-chromium
+
+# 3. Start the daemon in one terminal
+./build/tenboxd --data-dir /tmp/tenbox-dev
+
+# 4. In another terminal: create and launch the VM
+./build/tenbox doctor
+./build/tenbox vm create --name chromium-vm \
+    --kernel build/Image \
+    --initrd build/initramfs-x86_64.cpio.gz \
+    --disk build/rootfs.qcow2 \
+    --memory 2048 --cpus 2
+./build/tenbox vm start <id>
+./build/tenbox vm console <id>
+```
+
+Replace `<id>` with the VM ID printed by `vm create`. The default root password inside the guest is `tenbox`.
+
 ## Documentation
 
 - **User guide** (Chinese): **[养虾教程](https://my.feishu.cn/wiki/Q96KwUH1Di3cAik2W7kcQsWKncb)** (Feishu Wiki)
