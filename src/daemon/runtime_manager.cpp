@@ -586,7 +586,15 @@ void RuntimeManager::ReadRuntime(std::shared_ptr<RuntimeSession> session) {
         const std::string header = session->runtime_conn->ReadLine();
         if (header.empty()) break;
         auto message = ipc::Decode(header);
-        if (!message) continue;
+        if (!message) {
+            std::fprintf(stdout, "[DEBUG] runtime_manager: failed to decode: %.80s\n", header.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        if (message->channel == ipc::Channel::kDisplay) {
+            std::fprintf(stdout, "[DEBUG] runtime_manager: recv display.%s\n", message->type.c_str());
+            std::fflush(stdout);
+        }
         auto payload_size_it = message->fields.find("payload_size");
         if (payload_size_it != message->fields.end()) {
             const size_t size = static_cast<size_t>(std::stoull(payload_size_it->second));
@@ -796,6 +804,9 @@ void RuntimeManager::HandleRuntimeMessage(std::shared_ptr<RuntimeSession> sessio
             if (shm_it != message.fields.end() && width > 0 && height > 0) {
                 auto framebuffer = std::make_unique<ipc::SharedFramebuffer>();
                 const bool opened = framebuffer->Open(shm_it->second, width, height);
+                std::fprintf(stdout, "[DEBUG] runtime_manager: shm_init name=%s size=%ux%u opened=%d\n",
+                             shm_it->second.c_str(), width, height, opened);
+                std::fflush(stdout);
                 {
                     std::lock_guard<std::mutex> lock(session->console_mutex);
                     session->last_frame["shm_name"] = shm_it->second;
@@ -943,6 +954,8 @@ bool RuntimeManager::SendKeyEvent(const std::string& vm_id, uint32_t key_code, b
 bool RuntimeManager::SendPointerEvent(const std::string& vm_id, int x, int y, uint32_t buttons) {
     auto session = FindSession(vm_id);
     if (!session) return false;
+    std::fprintf(stdout, "[DEBUG] runtime_manager: SendPointerEvent x=%d y=%d buttons=%u\n", x, y, buttons);
+    std::fflush(stdout);
     ipc::Message message;
     message.channel = ipc::Channel::kInput;
     message.kind = ipc::Kind::kRequest;
@@ -1348,6 +1361,11 @@ void RuntimeManager::UpdateRemoteVideoFrameLocked(RuntimeSession& session, const
     const bool emit_full = session.remote_frame_force_full || reinitialize;
 
     if (emit_full) {
+        const uint8_t* fb = session.framebuffer->data();
+        uint32_t pixel = fb ? (fb[0] | (fb[1] << 8) | (fb[2] << 16) | (fb[3] << 24)) : 0;
+        std::fprintf(stdout, "[DEBUG] runtime_manager: MakeSliceFromBgra full %ux%u pixel0=0x%08x\n",
+                     frame_width, frame_height, pixel);
+        std::fflush(stdout);
         RemoteVideoSlice full = MakeSliceFromBgra(
             session.framebuffer->data(),
             static_cast<int>(session.framebuffer->stride()),

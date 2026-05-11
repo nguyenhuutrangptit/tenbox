@@ -205,6 +205,8 @@ private:
     std::shared_ptr<DisplayPort> display_port_;
     std::shared_ptr<ClipboardPort> clipboard_port_;
     std::shared_ptr<AudioPort> audio_port_;
+    uint32_t display_width_ = 1024;
+    uint32_t display_height_ = 768;
     uint32_t inject_prev_buttons_ = 0;
 
     std::vector<std::unique_ptr<VCpuStartupState>> vcpu_startup_;

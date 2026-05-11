@@ -8,6 +8,7 @@ std::optional<RemoteSession> RemoteSessionRegistry::Create(
     const std::string& vm_id,
     const std::string& owner_user_id,
     bool force) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (!force && by_vm_.count(vm_id)) return std::nullopt;
 
     RemoteSession session;
@@ -20,6 +21,7 @@ std::optional<RemoteSession> RemoteSessionRegistry::Create(
 }
 
 bool RemoteSessionRegistry::Close(const std::string& vm_id, const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = by_vm_.find(vm_id);
     if (it == by_vm_.end()) return false;
     if (it->second.session_id != session_id) return false;
@@ -28,6 +30,7 @@ bool RemoteSessionRegistry::Close(const std::string& vm_id, const std::string& s
 }
 
 std::optional<RemoteSession> RemoteSessionRegistry::GetByVm(const std::string& vm_id) const {
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = by_vm_.find(vm_id);
     if (it == by_vm_.end()) return std::nullopt;
     return it->second;

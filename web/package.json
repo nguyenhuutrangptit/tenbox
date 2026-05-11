@@ -1,0 +1,26 @@
+{
+  "name": "tenbox-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev:server": "node server.js",
+    "dev:client": "vite",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "build": "vite build",
+    "start": "node server.js",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "vue": "^3.5.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "concurrently": "^9.0.0",
+    "vite": "^6.0.0"
+  }
+}

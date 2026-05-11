@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -23,6 +24,7 @@ public:
     std::optional<RemoteSession> GetByVm(const std::string& vm_id) const;
 
 private:
+    mutable std::mutex mu_;
     std::unordered_map<std::string, RemoteSession> by_vm_;
 };
 

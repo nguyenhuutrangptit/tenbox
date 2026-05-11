@@ -501,6 +501,7 @@ void CloudTunnel::Disconnect() {
     // teardown bails out instead of racing into SSL_write on a half-closed
     // SSL object.
     connected_.store(false);
+    std::lock_guard<std::mutex> lock(send_mu_);
     if (ssl_) {
         // Best-effort shutdown; SSL_shutdown returning 0 means peer hasn't
         // sent close_notify yet, but we always close the underlying fd next
@@ -795,6 +796,7 @@ bool CloudTunnel::ReadJson(nlohmann::json* value) {
 
 void CloudTunnel::ThreadMain() {
     pthread_setname_np(pthread_self(), "cloud-tunnel");
+    try {
     // Exponential backoff for reconnect attempts. Caps at 60s so a flaky
     // network or temporary cloud outage does not keep the journal at the
     // previous 1-attempt-per-second cadence (which on a host with broken
@@ -908,6 +910,11 @@ void CloudTunnel::ThreadMain() {
         if (running_) {
             interruptible_sleep(backoff);
         }
+    }
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled exception in ThreadMain: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled non-standard exception in ThreadMain\n";
     }
 }
 
@@ -1185,6 +1192,7 @@ nlohmann::json CloudTunnel::HandleRequest(const nlohmann::json& request) {
     const std::string id = request.value("id", GenerateUuid());
     const std::string type = request.value("type", "");
     const std::string vm_id = request.value("vm_id", "");
+    try {
     nlohmann::json payload;
 
     if (type == "host.resources" || type == "device.capabilities") {
@@ -1258,6 +1266,15 @@ nlohmann::json CloudTunnel::HandleRequest(const nlohmann::json& request) {
     }
     return {{"id", id}, {"type", type + ".response"}, {"host_id", host_id_},
             {"vm_id", vm_id}, {"payload", Ok(std::move(payload))}};
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled exception in HandleRequest: " << e.what() << "\n";
+        return {{"id", id}, {"type", type + ".response"}, {"host_id", host_id_},
+                {"vm_id", vm_id}, {"payload", Error("internal_error", std::string("unhandled exception: ") + e.what())}};
+    } catch (...) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled non-standard exception in HandleRequest\n";
+        return {{"id", id}, {"type", type + ".response"}, {"host_id", host_id_},
+                {"vm_id", vm_id}, {"payload", Error("internal_error", "unhandled non-standard exception")}};
+    }
 }
 
 nlohmann::json CloudTunnel::HandleHostUpdate(const std::string& id,
@@ -2088,6 +2105,7 @@ void CloudTunnel::PublishRemoteCursor(const std::string& vm_id, nlohmann::json c
 
 void CloudTunnel::TickMain() {
     pthread_setname_np(pthread_self(), "cloud-tick");
+    try {
     // Push host memory/disk/load and per-VM disk/RSS on a slow schedule so
     // tenboxd stays light: host metrics are cheap; VmResourcesSnapshot walks
     // each VM directory for disk usage and is intentionally less frequent.
@@ -2170,6 +2188,11 @@ void CloudTunnel::TickMain() {
         if (wait_ms > kMaxSleepMs) wait_ms = kMaxSleepMs;
         if (wait_ms == 0) wait_ms = 50;
         std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+    }
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled exception in TickMain: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[ERROR] cloud_tunnel: unhandled non-standard exception in TickMain\n";
     }
 }
 

@@ -85,6 +85,9 @@ if(NOT TARGET LibDataChannel::LibDataChannel)
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libdatachannel)
+    if(TARGET juice)
+        target_compile_definitions(juice PRIVATE JUICE_DISABLE_CONSENT_FRESHNESS=1)
+    endif()
     set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED} CACHE BOOL "" FORCE)
 endif()
 

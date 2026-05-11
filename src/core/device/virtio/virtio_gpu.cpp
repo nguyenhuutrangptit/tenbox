@@ -352,6 +352,9 @@ void VirtioGpuDevice::CmdSetScanout(const uint8_t* req, uint32_t req_len,
         return;
     }
     auto* cmd = reinterpret_cast<const VirtioGpuSetScanout*>(req);
+    std::fprintf(stdout, "[DEBUG] virtio_gpu: CmdSetScanout resource=%u rect=%u,%u %ux%u\n",
+                 cmd->resource_id, cmd->r.x, cmd->r.y, cmd->r.width, cmd->r.height);
+    std::fflush(stdout);
     if (cmd->scanout_id != 0) {
         WriteResponse(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, resp_len);
         return;
@@ -398,6 +401,9 @@ void VirtioGpuDevice::CmdTransferToHost2d(const uint8_t* req, uint32_t req_len,
         return;
     }
     auto* cmd = reinterpret_cast<const VirtioGpuTransferToHost2d*>(req);
+    std::fprintf(stdout, "[DEBUG] virtio_gpu: CmdTransferToHost2d resource=%u rect=%u,%u %ux%u\n",
+                 cmd->resource_id, cmd->r.x, cmd->r.y, cmd->r.width, cmd->r.height);
+    std::fflush(stdout);
     auto it = resources_.find(cmd->resource_id);
     if (it == resources_.end()) {
         WriteResponse(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, resp_len);
@@ -441,6 +447,14 @@ void VirtioGpuDevice::CmdTransferToHost2d(const uint8_t* req, uint32_t req_len,
                         res.host_pixels.data() + dst_off);
     }
 
+    uint32_t pixel = 0;
+    if (!res.host_pixels.empty()) {
+        pixel = res.host_pixels[0] | (res.host_pixels[1] << 8) | (res.host_pixels[2] << 16) | (res.host_pixels[3] << 24);
+    }
+    std::fprintf(stdout, "[DEBUG] virtio_gpu: TransferToHost2d done resource=%u pixel0=0x%08x backing=%zu total_backing=%lu\n",
+                 cmd->resource_id, pixel, res.backing.size(), total_backing);
+    std::fflush(stdout);
+
     WriteResponse(resp, VIRTIO_GPU_RESP_OK_NODATA, resp_len);
 }
 
@@ -458,6 +472,9 @@ void VirtioGpuDevice::CmdResourceFlush(const uint8_t* req, uint32_t req_len,
     }
 
     // Only flush if this resource is the active scanout
+    std::fprintf(stdout, "[DEBUG] virtio_gpu: CmdResourceFlush resource=%u scanout=%u cb=%s\n",
+                 cmd->resource_id, scanout_resource_id_, frame_callback_ ? "set" : "null");
+    std::fflush(stdout);
     if (cmd->resource_id == scanout_resource_id_ && frame_callback_) {
         auto& res = it->second;
         uint32_t bpp = FormatBpp(res.format);

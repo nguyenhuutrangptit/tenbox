@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <thread>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -145,45 +146,58 @@ void RpcServer::Stop() {
 
 void RpcServer::HandleClient(ipc::UnixSocketConnection client) {
     pthread_setname_np(pthread_self(), "rpc-handler");
-    const std::string line = client.ReadLine();
-    if (line.empty()) return;
-    auto request = nlohmann::json::parse(line, nullptr, false);
-    if (request.is_discarded()) {
-        auto response = Error("bad_json", "request is not valid JSON").dump() + "\n";
+    try {
+        const std::string line = client.ReadLine();
+        if (line.empty()) return;
+        auto request = nlohmann::json::parse(line, nullptr, false);
+        if (request.is_discarded()) {
+            auto response = Error("bad_json", "request is not valid JSON").dump() + "\n";
+            (void)client.Send(response);
+            return;
+        }
+
+        if (request.value("type", "") == "vm.console.attach") {
+            std::string error;
+            if (!runtime_manager_.AttachConsole(request.value("vm_id", ""), &client, &error)) {
+                auto response = Error("console_attach_failed", error).dump() + "\n";
+                (void)client.Send(response);
+                return;
+            }
+            return;
+        }
+
+        if (request.value("type", "") == "vm.logs.follow") {
+            std::string error;
+            if (!runtime_manager_.AttachLogFollower(request.value("vm_id", ""), &client, &error)) {
+                auto response = Error("logs_follow_failed", error).dump() + "\n";
+                (void)client.Send(response);
+                return;
+            }
+            return;
+        }
+
+        auto response = HandleRequest(request).dump();
+        response.push_back('\n');
         (void)client.Send(response);
-        return;
-    }
-
-    if (request.value("type", "") == "vm.console.attach") {
-        std::string error;
-        if (!runtime_manager_.AttachConsole(request.value("vm_id", ""), &client, &error)) {
-            auto response = Error("console_attach_failed", error).dump() + "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] rpc_server: unhandled exception in HandleClient: " << e.what() << "\n";
+        try {
+            auto response = Error("internal_error", std::string("unhandled exception: ") + e.what()).dump() + "\n";
             (void)client.Send(response);
-            return;
+        } catch (...) {
+            // ignore
         }
-        return;
+    } catch (...) {
+        std::cerr << "[ERROR] rpc_server: unhandled non-standard exception in HandleClient\n";
     }
-
-    if (request.value("type", "") == "vm.logs.follow") {
-        std::string error;
-        if (!runtime_manager_.AttachLogFollower(request.value("vm_id", ""), &client, &error)) {
-            auto response = Error("logs_follow_failed", error).dump() + "\n";
-            (void)client.Send(response);
-            return;
-        }
-        return;
-    }
-
-    auto response = HandleRequest(request).dump();
-    response.push_back('\n');
-    (void)client.Send(response);
 }
 
 nlohmann::json RpcServer::HandleRequest(const nlohmann::json& request) {
-    const std::string type = request.value("type", "");
-    if (type == "doctor") {
-        return Ok(ToJson(RunKvmDoctor()));
-    }
+    try {
+        const std::string type = request.value("type", "");
+        if (type == "doctor") {
+            return Ok(ToJson(RunKvmDoctor()));
+        }
     if (type == "system.info") {
         return Ok({
             {"data_dir", config_.data_dir},
@@ -298,7 +312,19 @@ nlohmann::json RpcServer::HandleRequest(const nlohmann::json& request) {
         }
         return Ok();
     }
+    if (type.rfind("remote_signal.", 0) == 0 ||
+        type == "remote_session.configure" ||
+        type == "remote_session.resize") {
+        return HandleRemoteSignal(request);
+    }
     return Error("unknown_request", "unknown request type: " + type);
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] rpc_server: unhandled exception in HandleRequest: " << e.what() << "\n";
+        return Error("internal_error", std::string("unhandled exception: ") + e.what());
+    } catch (...) {
+        std::cerr << "[ERROR] rpc_server: unhandled non-standard exception in HandleRequest\n";
+        return Error("internal_error", "unhandled non-standard exception");
+    }
 }
 
 nlohmann::json RpcServer::CreateVm(const nlohmann::json& request) {
@@ -450,6 +476,154 @@ nlohmann::json RpcServer::VmResources(const VmRecord& record) const {
         out["process"] = ToJson(runtime_manager_.SampleProcessResources(record.spec.vm_id));
     }
     return out;
+}
+
+nlohmann::json RpcServer::HandleRemoteSignal(const nlohmann::json& request) {
+    const std::string type = request.value("type", "");
+    const std::string vm_id = request.value("vm_id", "");
+    const std::string session_id = request.value("session_id", "");
+
+    if (type == "remote_signal.offer") {
+        auto session = remote_sessions_.GetByVm(vm_id);
+        if (!session || session->session_id != session_id) {
+            return Error("remote_session_not_found", "remote session not found");
+        }
+        std::shared_ptr<WebRtcPeer> peer;
+        {
+            std::lock_guard<std::mutex> lock(remote_peers_mu_);
+            auto it = remote_peers_.find(session_id);
+            if (it == remote_peers_.end()) {
+                it = remote_peers_.emplace(session_id, CreateRemotePeer(session_id, vm_id)).first;
+            }
+            peer = it->second;
+        }
+        auto answer = peer->AcceptOffer(request.value("sdp", ""));
+        return Ok({
+            {"type", "answer"},
+            {"sdp", answer.sdp},
+            {"candidates", answer.candidates},
+            {"webrtc_ready", answer.ok},
+            {"message", answer.ok ? "answer created" : answer.error},
+        });
+    }
+
+    if (type == "remote_signal.candidate") {
+        std::shared_ptr<WebRtcPeer> peer;
+        {
+            std::lock_guard<std::mutex> lock(remote_peers_mu_);
+            auto it = remote_peers_.find(session_id);
+            if (it != remote_peers_.end()) peer = it->second;
+        }
+        if (!peer) return Error("remote_session_not_found", "remote session not found");
+        std::string error;
+        bool accepted = peer->AddIceCandidate(request, &error);
+        if (!accepted) return Error("candidate_rejected", error.empty() ? "failed to add ICE candidate" : error);
+        return Ok({{"accepted", true}});
+    }
+
+    if (type == "remote_session.configure") {
+        std::shared_ptr<WebRtcPeer> peer;
+        {
+            std::lock_guard<std::mutex> lock(remote_peers_mu_);
+            auto it = remote_peers_.find(session_id);
+            if (it != remote_peers_.end()) peer = it->second;
+        }
+        if (!peer) return Error("remote_session_not_found", "remote session not found");
+        const auto payload = request.value("payload", nlohmann::json::object());
+        if (payload.contains("video_bitrate_bps")) {
+            peer->SetVideoBitrate(payload.value("video_bitrate_bps", static_cast<uint32_t>(4'000'000)));
+        }
+        return Ok();
+    }
+
+    if (type == "remote_session.resize") {
+        auto session = remote_sessions_.GetByVm(vm_id);
+        if (!session || session->session_id != session_id) {
+            return Error("remote_session_not_found", "remote session not found");
+        }
+        const auto payload = request.value("payload", nlohmann::json::object());
+        const uint32_t width = payload.value("width", static_cast<uint32_t>(1280));
+        const uint32_t height = payload.value("height", static_cast<uint32_t>(720));
+        if (!runtime_manager_.SetDisplaySize(vm_id, width, height)) {
+            return Error("runtime_not_attached", "failed to resize runtime display");
+        }
+        return Ok({{"width", width}, {"height", height}});
+    }
+
+    return Error("unknown_request", "unknown remote signal type: " + type);
+}
+
+std::shared_ptr<WebRtcPeer> RpcServer::CreateRemotePeer(
+    const std::string& session_id,
+    const std::string& vm_id) {
+    auto peer = CreateWebRtcPeer(
+        [this, vm_id](RemoteVideoFrame* frame, bool need_full,
+                      std::chrono::milliseconds wait_timeout) {
+            if (!frame) return false;
+            return runtime_manager_.ReadRemoteFrame(vm_id, frame, need_full, wait_timeout);
+        });
+    if (peer) {
+        peer->SetDataChannelHandler([this, vm_id](const nlohmann::json& message) {
+            HandleDataChannelMessage(vm_id, message);
+        });
+        peer->SetPeerClosedHandler([this, session_id, vm_id](std::string /*reason*/) {
+            std::thread([this, session_id, vm_id]() {
+                pthread_setname_np(pthread_self(), "webrtc-close");
+                CleanupRemotePeer(session_id, vm_id);
+            }).detach();
+        });
+        peer->SetDataChannelOpenHandler([this, session_id, vm_id](const std::string& label) {
+            if (label != "control") return;
+            nlohmann::json cursor = runtime_manager_.CursorSnapshot(vm_id);
+            if (!cursor.is_object() || cursor.empty()) return;
+            std::shared_ptr<WebRtcPeer> p;
+            {
+                std::lock_guard<std::mutex> lock(remote_peers_mu_);
+                auto it = remote_peers_.find(session_id);
+                if (it != remote_peers_.end()) p = it->second;
+            }
+            if (!p) return;
+            (void)p->SendOnDataChannel("control", nlohmann::json{
+                {"type", "cursor"},
+                {"cursor", std::move(cursor)},
+            }.dump());
+        });
+    }
+    return peer;
+}
+
+void RpcServer::HandleDataChannelMessage(const std::string& vm_id, const nlohmann::json& message) {
+    if (!message.is_object()) return;
+    const std::string type = message.value("type", "");
+    if (type.empty()) return;
+    std::fprintf(stdout, "[DEBUG] rpc_server: dc_msg type=%s vm=%s\n", type.c_str(), vm_id.c_str());
+    std::fflush(stdout);
+    if (type == "pointer") {
+        runtime_manager_.SendPointerEvent(
+            vm_id,
+            message.value("x", 0),
+            message.value("y", 0),
+            message.value("buttons", static_cast<uint32_t>(0)));
+    } else if (type == "wheel") {
+        runtime_manager_.SendWheelEvent(vm_id, message.value("delta", 0));
+    } else if (type == "key") {
+        runtime_manager_.SendKeyEvent(
+            vm_id,
+            message.value("key_code", static_cast<uint32_t>(0)),
+            message.value("pressed", false));
+    }
+}
+
+void RpcServer::CleanupRemotePeer(const std::string& session_id, const std::string& vm_id) {
+    std::fprintf(stdout, "[INFO]  rpc_server: tearing down remote peer %s on vm %s\n",
+                 session_id.c_str(), vm_id.c_str());
+    std::fflush(stdout);
+    {
+        std::lock_guard<std::mutex> lock(remote_peers_mu_);
+        remote_peers_.erase(session_id);
+    }
+    runtime_manager_.ClearClipboardCallback(vm_id);
+    (void)remote_sessions_.Close(vm_id, session_id);
 }
 
 }  // namespace tenbox::daemon

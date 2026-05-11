@@ -7,9 +7,15 @@
 #include "common/image_source.h"
 #include "version.h"
 
+#include <csignal>
+#include <cstdlib>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
@@ -34,9 +40,62 @@ void PrintUsage(const char* prog) {
         << "  --help                Show help\n";
 }
 
+void PrintBacktrace() {
+    void* buffer[64];
+    const int n = backtrace(buffer, 64);
+    backtrace_symbols_fd(buffer, n, STDERR_FILENO);
+}
+
+void SignalHandler(int sig) {
+    const char* name = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: name = "SIGSEGV"; break;
+        case SIGABRT: name = "SIGABRT"; break;
+        case SIGILL:  name = "SIGILL";  break;
+        case SIGFPE:  name = "SIGFPE";  break;
+        case SIGBUS:  name = "SIGBUS";  break;
+    }
+    std::cerr << "[FATAL] tenboxd caught signal " << sig << " (" << name << ")\n";
+    PrintBacktrace();
+    std::cerr << "[FATAL] re-raising signal for core dump\n";
+    std::signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void InstallFatalSignalHandlers() {
+    struct sigaction sa{};
+    sa.sa_handler = SignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
+    sigaction(SIGFPE,  &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+}
+
+void TerminateHandler() {
+    std::cerr << "[FATAL] std::terminate called\n";
+    if (std::exception_ptr ep = std::current_exception()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            std::cerr << "[FATAL] uncaught exception: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[FATAL] uncaught non-standard exception\n";
+        }
+    }
+    PrintBacktrace();
+    std::abort();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN);
+    InstallFatalSignalHandlers();
+    std::set_terminate(TerminateHandler);
+
     tenbox::daemon::DaemonConfig config;
     config.data_dir = tenbox::daemon::DefaultDataDir();
     config.socket_path = tenbox::daemon::DefaultSocketPath();
@@ -86,49 +145,55 @@ int main(int argc, char** argv) {
         return report.supported ? 0 : 2;
     }
 
-    tenbox::daemon::VmStore store(config.data_dir);
-    std::string error;
-    if (!store.Load(&error)) {
-        std::cerr << "failed to load VM store: " << error << "\n";
+    try {
+        tenbox::daemon::VmStore store(config.data_dir);
+        std::string error;
+        if (!store.Load(&error)) {
+            std::cerr << "failed to load VM store: " << error << "\n";
+            return 1;
+        }
+
+        const auto images_dir =
+            (std::filesystem::path(config.data_dir) / "images").string();
+        if (const size_t cleaned =
+                image_source::CleanupStaleImageCache(images_dir);
+            cleaned > 0) {
+            std::cout << "cleaned up " << cleaned
+                      << " stale image cache directory(ies) under " << images_dir
+                      << "\n";
+        }
+
+        tenbox::daemon::RuntimeManager runtime_manager(config, store);
+        tenbox::daemon::RpcServer rpc(config, store, runtime_manager);
+        if (!rpc.Start(&error)) {
+            std::cerr << "failed to start RPC server: " << error << "\n";
+            return 1;
+        }
+
+        std::cout << "tenboxd listening on " << config.socket_path << "\n";
+        if (!config.cloud_url.empty()) {
+            std::cout << "cloud tunnel configured for " << config.cloud_url
+                      << (cloud_url_explicit ? " (--cloud-url)" : " (default)") << "\n";
+        } else {
+            std::cout << "cloud tunnel disabled (cloud_url is empty)\n";
+        }
+
+        tenbox::daemon::CloudTunnel cloud_tunnel(config, store, runtime_manager);
+        if (!cloud_tunnel.Start(&error)) {
+            std::cerr << "failed to start cloud tunnel: " << error << "\n";
+            return 1;
+        }
+
+        rpc.Run();
+    } catch (const std::exception& e) {
+        std::cerr << "[FATAL] unhandled exception in main: " << e.what() << "\n";
+        PrintBacktrace();
+        return 1;
+    } catch (...) {
+        std::cerr << "[FATAL] unhandled non-standard exception in main\n";
+        PrintBacktrace();
         return 1;
     }
 
-    // Sweep `images/` for half-finished downloads from a previous run that
-    // was killed before the cache directory could be removed (SIGKILL,
-    // power loss, etc.). Without this, hard-killed downloads accumulate
-    // silently because the manifest never lands and IsImageCached/UI
-    // both ignore the directory while disk usage keeps growing.
-    const auto images_dir =
-        (std::filesystem::path(config.data_dir) / "images").string();
-    if (const size_t cleaned =
-            image_source::CleanupStaleImageCache(images_dir);
-        cleaned > 0) {
-        std::cout << "cleaned up " << cleaned
-                  << " stale image cache directory(ies) under " << images_dir
-                  << "\n";
-    }
-
-    tenbox::daemon::RuntimeManager runtime_manager(config, store);
-    tenbox::daemon::RpcServer rpc(config, store, runtime_manager);
-    if (!rpc.Start(&error)) {
-        std::cerr << "failed to start RPC server: " << error << "\n";
-        return 1;
-    }
-
-    std::cout << "tenboxd listening on " << config.socket_path << "\n";
-    if (!config.cloud_url.empty()) {
-        std::cout << "cloud tunnel configured for " << config.cloud_url
-                  << (cloud_url_explicit ? " (--cloud-url)" : " (default)") << "\n";
-    } else {
-        std::cout << "cloud tunnel disabled (cloud_url is empty)\n";
-    }
-
-    tenbox::daemon::CloudTunnel cloud_tunnel(config, store, runtime_manager);
-    if (!cloud_tunnel.Start(&error)) {
-        std::cerr << "failed to start cloud tunnel: " << error << "\n";
-        return 1;
-    }
-
-    rpc.Run();
     return 0;
 }

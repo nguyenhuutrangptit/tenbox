@@ -150,7 +150,11 @@ void ManagedDisplayPort::SubmitFrame(DisplayFrame frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         handler = frame_handler_;
     }
-    if (handler) handler(std::move(frame));
+    if (handler) {
+        handler(std::move(frame));
+    } else {
+        LOG_ERROR("RuntimeService: SubmitFrame called but no handler set");
+    }
 }
 
 void ManagedDisplayPort::SubmitCursor(const CursorInfo& cursor) {
@@ -261,6 +265,7 @@ RuntimeControlService::RuntimeControlService(std::string vm_id, std::string pipe
     display_port_->SetFrameHandler([this](DisplayFrame frame) {
         uint32_t resW = frame.resource_width ? frame.resource_width : frame.width;
         uint32_t resH = frame.resource_height ? frame.resource_height : frame.height;
+        LOG_INFO("RuntimeService: frame handler called %ux%u res=%ux%u", frame.width, frame.height, resW, resH);
 
         // Create or resize shared framebuffer when resource dimensions change.
         // Each resize uses a unique name (generation suffix) so the Manager
@@ -306,6 +311,9 @@ RuntimeControlService::RuntimeControlService(std::string vm_id, std::string pipe
         const uint8_t* src = frame.data();
         uint8_t* dst = shm_fb_.data();
 
+        uint32_t src_pixel = src ? (src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)) : 0;
+        uint32_t dst_pixel_before = dst ? (dst[0] | (dst[1] << 8) | (dst[2] << 16) | (dst[3] << 24)) : 0;
+
         for (uint32_t row = 0; row < dh; ++row) {
             size_t src_off = static_cast<size_t>(row) * src_stride;
             size_t dst_off = static_cast<size_t>(dy + row) * dst_stride +
@@ -314,6 +322,10 @@ RuntimeControlService::RuntimeControlService(std::string vm_id, std::string pipe
             if (dst_off + dw * 4 > shm_fb_.size()) break;
             std::memcpy(dst + dst_off, src + src_off, dw * 4);
         }
+
+        uint32_t dst_pixel_after = dst ? (dst[0] | (dst[1] << 8) | (dst[2] << 16) | (dst[3] << 24)) : 0;
+        LOG_INFO("RuntimeService: blit %ux%u@%u,%u src_pixel=0x%08x dst_before=0x%08x dst_after=0x%08x",
+                 dw, dh, dx, dy, src_pixel, dst_pixel_before, dst_pixel_after);
 
         // Send lightweight metadata-only notification.
         uint64_t seq = ++shm_frame_seq_;
@@ -556,10 +568,18 @@ void RuntimeControlService::WriteRaw(const std::string& data) {
 
     uv_buf_t buf = uv_buf_init(const_cast<char*>(write_data->data()),
                                 static_cast<unsigned int>(write_data->size()));
-    uv_write(req, reinterpret_cast<uv_stream_t*>(&pipe_), &buf, 1, OnWriteDone);
+    int rc = uv_write(req, reinterpret_cast<uv_stream_t*>(&pipe_), &buf, 1, OnWriteDone);
+    if (rc != 0) {
+        LOG_ERROR("RuntimeService: uv_write failed: %s", uv_strerror(rc));
+        delete write_data;
+        delete req;
+    }
 }
 
-void RuntimeControlService::OnWriteDone(uv_write_t* req, int /*status*/) {
+void RuntimeControlService::OnWriteDone(uv_write_t* req, int status) {
+    if (status < 0) {
+        LOG_ERROR("RuntimeService: write failed: %s", uv_strerror(status));
+    }
     delete static_cast<std::string*>(req->data);
     delete req;
 }
@@ -866,6 +886,7 @@ void RuntimeControlService::HandleMessage(const ipc::Message& message) {
         if (it_x != message.fields.end()) ev.x = std::atoi(it_x->second.c_str());
         if (it_y != message.fields.end()) ev.y = std::atoi(it_y->second.c_str());
         if (it_btn != message.fields.end()) ev.buttons = static_cast<uint32_t>(std::strtoul(it_btn->second.c_str(), nullptr, 10));
+        LOG_INFO("RuntimeService: input.pointer_event x=%d y=%d buttons=%u", ev.x, ev.y, ev.buttons);
         input_port_->PushPointerEvent(ev);
         return;
     }
@@ -998,6 +1019,7 @@ void RuntimeControlService::DrainSendQueues() {
     }
 
     if (batch.empty()) return;
+    LOG_INFO("RuntimeService: DrainSendQueues sending %zu bytes", batch.size());
     WriteRaw(batch);
 }
 

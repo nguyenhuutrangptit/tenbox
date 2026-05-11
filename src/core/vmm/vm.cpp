@@ -200,6 +200,8 @@ std::unique_ptr<Vm> Vm::Create(const VmConfig& config) {
         return nullptr;
 
     vm->cpu_count_ = config.cpu_count;
+    vm->display_width_ = config.display_width;
+    vm->display_height_ = config.display_height;
     // Resize the vCPU slot vector; actual vCPU objects are created per-thread.
     vm->vcpus_.resize(config.cpu_count);
 
@@ -953,10 +955,20 @@ void Vm::InjectKeyEvent(uint32_t evdev_code, bool pressed) {
 
 void Vm::InjectPointerEvent(int32_t x, int32_t y, uint32_t buttons) {
     if (virtio_tablet_) {
+        // Scale browser pixel coordinates to virtio tablet's 0-32767 ABS range.
+        const int32_t abs_max = 32767;
+        int32_t sx = 0, sy = 0;
+        if (display_width_ > 0) {
+            sx = static_cast<int32_t>(std::clamp(x, 0, static_cast<int32_t>(display_width_)) * abs_max / static_cast<int32_t>(display_width_));
+        }
+        if (display_height_ > 0) {
+            sy = static_cast<int32_t>(std::clamp(y, 0, static_cast<int32_t>(display_height_)) * abs_max / static_cast<int32_t>(display_height_));
+        }
+        LOG_INFO("Vm::InjectPointerEvent: x=%d y=%d buttons=%u -> sx=%d sy=%d", x, y, buttons, sx, sy);
         virtio_tablet_->InjectEvent(EV_ABS, ABS_X,
-            static_cast<uint32_t>(x), false);
+            static_cast<uint32_t>(sx), false);
         virtio_tablet_->InjectEvent(EV_ABS, ABS_Y,
-            static_cast<uint32_t>(y), false);
+            static_cast<uint32_t>(sy), false);
         if ((buttons & 1) != (inject_prev_buttons_ & 1))
             virtio_tablet_->InjectEvent(EV_KEY, BTN_LEFT,
                 (buttons & 1) ? 1 : 0, false);
@@ -980,6 +992,8 @@ void Vm::InjectWheelEvent(int32_t delta) {
 }
 
 void Vm::SetDisplaySize(uint32_t width, uint32_t height) {
+    display_width_ = width;
+    display_height_ = height;
     if (virtio_gpu_) {
         virtio_gpu_->SetDisplaySize(width, height);
     }

@@ -74,7 +74,8 @@ void ConfigureCommonH264Context(AVCodecContext* codec, const VideoEncoderConfig&
     codec->bit_rate = static_cast<int64_t>(config.bitrate_bps);
     codec->rc_max_rate = static_cast<int64_t>(config.bitrate_bps);
     codec->rc_buffer_size = static_cast<int>(std::max<uint32_t>(config.bitrate_bps / 2, 1));
-    codec->gop_size = static_cast<int>(std::max<uint32_t>(config.framerate * 240, 1));
+    // Keyframe every 2s for fast decoder recovery on packet loss / new tabs.
+    codec->gop_size = static_cast<int>(std::max<uint32_t>(config.framerate * 2, 1));
     codec->max_b_frames = 0;
     // Single-threaded encoding minimizes per-frame latency for remote desktop.
     // Multi-thread parallelism adds a frame pipeline delay with no throughput
@@ -126,8 +127,11 @@ bool ConfigureLibx264(AVCodecContext* codec, const VideoEncoderConfig& config, s
         return false;
     }
 
-    av_opt_set(codec->priv_data, "keyint", "7200", 0);
-    av_opt_set(codec->priv_data, "min-keyint", "7200", 0);
+    // Fixed keyframe interval matching gop_size (2s); no scenecut so
+    // keyframes are predictable and don't burst bandwidth.
+    const auto keyint_str = std::to_string(std::max<uint32_t>(config.framerate * 2, 1));
+    av_opt_set(codec->priv_data, "keyint", keyint_str.c_str(), 0);
+    av_opt_set(codec->priv_data, "min-keyint", keyint_str.c_str(), 0);
     av_opt_set(codec->priv_data, "scenecut", "0", 0);
     const auto maxrate = std::to_string(config.bitrate_bps);
     const auto bufsize = std::to_string(config.bitrate_bps / 2);

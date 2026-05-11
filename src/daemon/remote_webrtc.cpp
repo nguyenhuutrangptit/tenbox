@@ -324,6 +324,7 @@ public:
           preferred_video_format_(preferred_video_format) {
         EnsureLibDatachannelLoggerInstalled();
         rtc::Configuration config;
+        config.enableIceTcp = false;
         for (const auto& spec : ConfiguredIceServers()) {
             for (const auto& url : spec.urls) {
                 try {
@@ -1518,6 +1519,9 @@ private:
                 if (!error.empty()) {
                     std::fprintf(stdout, "[WARN]  remote_webrtc: encode failed: %s\n", error.c_str());
                     std::fflush(stdout);
+                } else if (sent_frames == 0) {
+                    std::fprintf(stdout, "[WARN]  remote_webrtc: encode returned empty (EAGAIN or no output)\n");
+                    std::fflush(stdout);
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -1549,6 +1553,10 @@ private:
             }
             next_encode_time = now + base_frame_interval;
             ++sent_frames;
+            if (sent_frames == 1 || sent_frames % 60 == 0) {
+                std::fprintf(stdout, "[INFO]  remote_webrtc: sent %lu frames\n", sent_frames);
+                std::fflush(stdout);
+            }
         }
     }
 
