@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { RpcClient } from '../rpc.js'
+import { browserCodeToEvdev } from '../keycode-map.js'
 
 const props = defineProps({ vmId: String, fullscreen: Boolean })
 const emit = defineEmits(['back'])
@@ -38,6 +39,22 @@ let mouseX = 0
 let mouseY = 0
 const ripples = ref([])
 
+// Track which keys are currently pressed so we can release them on blur
+const pressedKeys = new Map() // browser code -> evdev code
+
+// Track pressed pointer buttons so we can release them on pointercancel
+const pressedPointerButtons = new Set()
+
+// Stop both default browser action AND event bubbling.
+// preventDefault() alone is NOT enough for browser shortcuts (Ctrl+T,
+// Ctrl+W, F12, etc.) — the event still bubbles to the browser's default
+// handlers.  stopPropagation() prevents that.  This is what noVNC and
+// Guacamole do on every input event.
+function stopEvent(e) {
+  e.preventDefault()
+  e.stopPropagation()
+}
+
 function log(msg) {
   console.log('[RemoteDesktop]', msg)
 }
@@ -46,15 +63,6 @@ function setError(msg) {
   error.value = msg
   status.value = 'error'
   statusMessage.value = msg
-}
-
-function browserButtonToVmBit(browserButton) {
-  switch (browserButton) {
-    case 0: return 1
-    case 1: return 4
-    case 2: return 2
-    default: return 0
-  }
 }
 
 function vmButtonsMask(browserButtons) {
@@ -171,6 +179,7 @@ async function startWebRTC() {
       status.value = 'connected'
       statusMessage.value = 'Connected'
       startFreezeCheck()
+      addBeforeUnloadProtection()
     } else if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
       if (status.value !== 'error') {
         status.value = 'disconnected'
@@ -180,6 +189,7 @@ async function startWebRTC() {
         clearInterval(freezeCheckInterval)
         freezeCheckInterval = null
       }
+      removeBeforeUnloadProtection()
     }
   }
 
@@ -286,7 +296,7 @@ function addRipple(cx, cy) {
   }, 600)
 }
 
-// ── Mouse events ─────────────────────────────────────────────────────────────
+// ── Mouse / Pointer events ───────────────────────────────────────────────────
 
 function getMousePos(e) {
   if (!containerRef.value || !videoRef.value) return { x: 0, y: 0 }
@@ -334,7 +344,8 @@ function getMousePos(e) {
   }
 }
 
-function onMouseMove(e) {
+function onPointerMove(e) {
+  stopEvent(e)
   const pos = getMousePos(e)
   // All pointer events (move + button state) must use the reliable
   // control channel.  input-fast is unordered/unreliable; a dropped
@@ -343,10 +354,12 @@ function onMouseMove(e) {
   sendControl('pointer', { x: pos.x, y: pos.y, buttons: vmButtonsMask(e.buttons) })
 }
 
-function onMouseDown(e) {
+function onPointerDown(e) {
+  stopEvent(e)
+  pressedPointerButtons.add(e.button)
   const pos = getMousePos(e)
   const buttons = vmButtonsMask(e.buttons)
-  log('mousedown button=' + e.button + ' buttons=' + buttons + ' pos=' + pos.x + ',' + pos.y)
+  log('pointerdown button=' + e.button + ' buttons=' + buttons + ' pos=' + pos.x + ',' + pos.y)
   sendControl('pointer', { x: pos.x, y: pos.y, buttons })
   // Use container coords for visual ripple placement
   const containerRect = containerRef.value?.getBoundingClientRect()
@@ -355,38 +368,162 @@ function onMouseDown(e) {
   addRipple(cx, cy)
 }
 
-function onMouseUp(e) {
+function onPointerUp(e) {
+  stopEvent(e)
+  pressedPointerButtons.delete(e.button)
   const pos = getMousePos(e)
   const buttons = vmButtonsMask(e.buttons)
-  log('mouseup button=' + e.button + ' buttons=' + buttons + ' pos=' + pos.x + ',' + pos.y)
+  log('pointerup button=' + e.button + ' buttons=' + buttons + ' pos=' + pos.x + ',' + pos.y)
   sendControl('pointer', { x: pos.x, y: pos.y, buttons })
 }
 
+function onPointerCancel(e) {
+  // Browser cancelled the pointer interaction (e.g. system gesture,
+  // tab switch, or pointer lock loss). Release any buttons that
+  // were pressed so the VM doesn't get stuck.
+  stopEvent(e)
+  log('pointercancel — releasing ' + pressedPointerButtons.size + ' stuck buttons')
+  const pos = getMousePos(e)
+  pressedPointerButtons.clear()
+  sendControl('pointer', { x: pos.x, y: pos.y, buttons: 0 })
+}
+
 function onWheel(e) {
-  e.preventDefault()
+  stopEvent(e)
   sendControl('wheel', { delta: -e.deltaY })
+}
+
+// Prevent browser context menu on right-click so it goes to the VM instead.
+function onContextMenu(e) {
+  stopEvent(e)
 }
 
 // ── Keyboard events ──────────────────────────────────────────────────────────
 
 function onKeyDown(e) {
-  e.preventDefault()
-  sendControl('key', { key_code: e.keyCode, pressed: true })
+  stopEvent(e)
+  const code = browserCodeToEvdev(e.code)
+  if (code === null) {
+    log('unmapped key: ' + e.code)
+    return
+  }
+  // Ignore browser auto-repeat. Browsers fire repeated keydown events
+  // while a key is held, but the guest OS should handle repeat itself.
+  // Sending repeats can flood the channel and cause stuck-key issues.
+  if (pressedKeys.has(e.code)) {
+    return
+  }
+  pressedKeys.set(e.code, code)
+  log('keydown code=' + e.code + ' evdev=' + code)
+  sendControl('key', { key_code: code, pressed: true })
 }
 
 function onKeyUp(e) {
-  e.preventDefault()
-  sendControl('key', { key_code: e.keyCode, pressed: false })
+  stopEvent(e)
+  const code = browserCodeToEvdev(e.code)
+  if (code === null) {
+    log('unmapped key: ' + e.code)
+    return
+  }
+  pressedKeys.delete(e.code)
+  log('keyup code=' + e.code + ' evdev=' + code)
+  sendControl('key', { key_code: code, pressed: false })
 }
 
-function requestPointerLock() {
-  if (containerRef.value && containerRef.value.requestPointerLock) {
-    containerRef.value.requestPointerLock()
+// Release all pressed keys when the window/tab loses focus.
+// Without this, keys held while Alt-Tabbing away stay "stuck" in the VM.
+function onWindowBlur() {
+  if (pressedKeys.size === 0) return
+  log('Window blur — releasing ' + pressedKeys.size + ' stuck keys')
+  for (const [browserCode, evdevCode] of pressedKeys) {
+    sendControl('key', { key_code: evdevCode, pressed: false })
+  }
+  pressedKeys.clear()
+}
+
+// ── Special keys toolbar ─────────────────────────────────────────────────────
+
+// Browser shortcuts that cannot be captured by web content (Ctrl+W, Ctrl+T,
+// Alt+F4, Meta key, etc.) can still be sent via toolbar buttons.
+
+function sendKeySequence(codes) {
+  // codes: array of { code, pressed, delay? }
+  for (const item of codes) {
+    sendControl('key', { key_code: item.code, pressed: item.pressed })
   }
 }
 
-function focusContainer() {
-  containerRef.value?.focus()
+function sendCtrlAltDel() {
+  log('Sending Ctrl+Alt+Del')
+  sendKeySequence([
+    { code: 29, pressed: true },   // CtrlLeft
+    { code: 56, pressed: true },   // AltLeft
+    { code: 111, pressed: true },  // Delete
+    { code: 111, pressed: false }, // Delete up
+    { code: 56, pressed: false },  // Alt up
+    { code: 29, pressed: false },  // Ctrl up
+  ])
+}
+
+function sendAltF4() {
+  log('Sending Alt+F4')
+  sendKeySequence([
+    { code: 56, pressed: true },  // AltLeft
+    { code: 62, pressed: true },  // F4
+    { code: 62, pressed: false }, // F4 up
+    { code: 56, pressed: false }, // Alt up
+  ])
+}
+
+function sendCtrlAltT() {
+  log('Sending Ctrl+Alt+T')
+  sendKeySequence([
+    { code: 29, pressed: true },  // CtrlLeft
+    { code: 56, pressed: true },  // AltLeft
+    { code: 20, pressed: true },  // KeyT
+    { code: 20, pressed: false }, // KeyT up
+    { code: 56, pressed: false }, // Alt up
+    { code: 29, pressed: false }, // Ctrl up
+  ])
+}
+
+function sendMetaKey() {
+  // The Meta key (Windows/Super) is usually captured by the OS and never
+  // reaches the browser. Send a brief press so the guest OS sees it.
+  log('Sending Meta key')
+  sendKeySequence([
+    { code: 125, pressed: true },  // MetaLeft
+    { code: 125, pressed: false }, // Meta up
+  ])
+}
+
+function sendEscape() {
+  log('Sending Escape')
+  sendKeySequence([
+    { code: 1, pressed: true },   // Escape
+    { code: 1, pressed: false },  // Escape up
+  ])
+}
+
+// ── Pointer lock & keyboard lock ─────────────────────────────────────────────
+
+async function requestPointerLock() {
+  if (!containerRef.value || !containerRef.value.requestPointerLock) return
+  try {
+    // Chrome 88+ supports unadjustedMovement (disable OS mouse acceleration).
+    const options = {}
+    if ('unadjustedMovement' in PointerEvent.prototype) {
+      try {
+        await containerRef.value.requestPointerLock({ unadjustedMovement: true })
+        return
+      } catch (err) {
+        // Fallback for browsers that reject unadjustedMovement
+      }
+    }
+    containerRef.value.requestPointerLock()
+  } catch (err) {
+    log('Pointer lock failed: ' + err.message)
+  }
 }
 
 function onPointerLockChange() {
@@ -399,6 +536,71 @@ function onPointerLockChange() {
     }
   }
   isPointerLocked.value = locked
+}
+
+function onPointerLockError() {
+  log('Pointer lock error')
+  isPointerLocked.value = false
+}
+
+// Request keyboard lock (Chrome/Edge only) to capture system shortcuts
+// like Escape, Alt+Tab, Ctrl+T, Ctrl+W in fullscreen mode.
+async function requestKeyboardLock() {
+  if ('keyboard' in navigator && 'lock' in navigator.keyboard) {
+    try {
+      // Lock ALL keys (empty array = everything)
+      await navigator.keyboard.lock()
+      log('Keyboard lock acquired')
+    } catch (err) {
+      log('Keyboard lock failed: ' + err.message)
+    }
+  } else {
+    log('Keyboard Lock API not supported in this browser')
+  }
+}
+
+async function unlockKeyboard() {
+  if ('keyboard' in navigator && 'unlock' in navigator.keyboard) {
+    try {
+      await navigator.keyboard.unlock()
+      log('Keyboard lock released')
+    } catch (err) {
+      // ignore
+    }
+  }
+}
+
+// Enter immersive mode: fullscreen + keyboard lock + pointer lock
+async function enterImmersiveMode() {
+  const el = containerRef.value
+  if (!el) return
+  try {
+    await el.requestFullscreen()
+    log('Fullscreen entered')
+  } catch (err) {
+    log('Fullscreen failed: ' + err.message)
+  }
+  requestKeyboardLock()
+  requestPointerLock()
+}
+
+function focusContainer() {
+  containerRef.value?.focus()
+}
+
+// ── Beforeunload protection ──────────────────────────────────────────────────
+
+function beforeUnloadHandler(event) {
+  event.preventDefault()
+  event.returnValue = '' // Legacy support for Chrome/Edge < 119
+}
+
+function addBeforeUnloadProtection() {
+  window.addEventListener('beforeunload', beforeUnloadHandler)
+}
+
+function removeBeforeUnloadProtection() {
+  window.removeEventListener('beforeunload', beforeUnloadHandler)
 }
 
 // ── Resize ───────────────────────────────────────────────────────────────────
@@ -423,6 +625,11 @@ function cleanup() {
     videoRef.value.cancelVideoFrameCallback(rvfcHandle)
     rvfcHandle = null
   }
+  // Release any stuck keys and keyboard lock
+  onWindowBlur()
+  unlockKeyboard()
+  removeBeforeUnloadProtection()
+  pressedPointerButtons.clear()
   if (pc.value) {
     pc.value.close()
     pc.value = null
@@ -533,16 +740,27 @@ function onVisibilityChange() {
 
 onMounted(() => {
   connect()
+  // Use window-level capture-phase keyboard listeners so shortcuts are
+  // intercepted regardless of which element has focus. This matches the
+  // behaviour of noVNC and Guacamole.
+  window.addEventListener('keydown', onKeyDown, true)
+  window.addEventListener('keyup', onKeyUp, true)
   document.addEventListener('pointerlockchange', onPointerLockChange)
+  document.addEventListener('pointerlockerror', onPointerLockError)
   window.addEventListener('resize', onResize)
   document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('blur', onWindowBlur)
 })
 
 onUnmounted(() => {
   cleanup()
+  window.removeEventListener('keydown', onKeyDown, true)
+  window.removeEventListener('keyup', onKeyUp, true)
   document.removeEventListener('pointerlockchange', onPointerLockChange)
+  document.removeEventListener('pointerlockerror', onPointerLockError)
   window.removeEventListener('resize', onResize)
   document.removeEventListener('visibilitychange', onVisibilityChange)
+  window.removeEventListener('blur', onWindowBlur)
 })
 </script>
 
@@ -557,21 +775,35 @@ onUnmounted(() => {
           'badge-error': status === 'error' || status === 'disconnected',
         }">{{ statusMessage }}</span>
       </div>
-      <button v-if="status === 'connected'" class="btn-primary btn-sm" @click="requestPointerLock">
-        {{ isPointerLocked ? 'Pointer locked' : 'Lock pointer' }}
-      </button>
+      <div class="rd-actions" style="display: flex; gap: 8px;">
+        <button v-if="status === 'connected'" class="btn-primary btn-sm" @click="enterImmersiveMode">
+          Immersive
+        </button>
+        <button v-if="status === 'connected'" class="btn-primary btn-sm" @click="requestPointerLock">
+          {{ isPointerLocked ? 'Pointer locked' : 'Lock pointer' }}
+        </button>
+      </div>
     </div>
 
     <div v-if="error" class="card-white" style="margin-top: 16px; color: #ef4444">
       {{ error }}
     </div>
 
+    <!-- Special keys toolbar -->
+    <div v-if="status === 'connected'" class="rd-toolbar">
+      <span class="rd-toolbar-label body-sm">Special keys:</span>
+      <button class="btn-secondary btn-xs" @click="sendCtrlAltDel">Ctrl+Alt+Del</button>
+      <button class="btn-secondary btn-xs" @click="sendAltF4">Alt+F4</button>
+      <button class="btn-secondary btn-xs" @click="sendCtrlAltT">Ctrl+Alt+T</button>
+      <button class="btn-secondary btn-xs" @click="sendMetaKey">Meta</button>
+      <button class="btn-secondary btn-xs" @click="sendEscape">Esc</button>
+    </div>
+
     <div
       ref="containerRef"
       class="rd-container"
       tabindex="0"
-      @keydown="onKeyDown"
-      @keyup="onKeyUp"
+      @contextmenu.prevent="onContextMenu"
       @click="focusContainer"
     >
       <video
@@ -588,10 +820,12 @@ onUnmounted(() => {
       <div
         v-if="status === 'connected'"
         class="rd-input-overlay"
-        @mousemove="onMouseMove"
-        @mousedown="onMouseDown"
-        @mouseup="onMouseUp"
+        @pointermove="onPointerMove"
+        @pointerdown="onPointerDown"
+        @pointerup="onPointerUp"
+        @pointercancel="onPointerCancel"
         @wheel="onWheel"
+        @contextmenu.prevent="onContextMenu"
       />
 
       <!-- Custom cursor -->
@@ -629,6 +863,7 @@ onUnmounted(() => {
 
     <div class="rd-hint body-sm" style="color: #6b7280; margin-top: 8px">
       Click the video area to focus. Use "Lock pointer" to capture mouse. Press Esc to release.
+      Keyboard shortcuts are captured at window level. Use the toolbar for keys the browser blocks.
     </div>
   </div>
 </template>
@@ -652,6 +887,19 @@ onUnmounted(() => {
 .rd-status {
   flex: 1;
   text-align: center;
+}
+
+.rd-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.rd-toolbar-label {
+  color: #6b7280;
+  font-weight: 500;
 }
 
 .rd-container {
@@ -682,6 +930,7 @@ onUnmounted(() => {
   bottom: 0;
   z-index: 5;
   cursor: crosshair;
+  touch-action: none;
 }
 
 .rd-cursor {

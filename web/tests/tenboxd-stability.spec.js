@@ -5,12 +5,21 @@ import fs from 'fs'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const UI_BASE = 'http://localhost:3000'
 const VM_ID = 'cda24e4e-1e7a-4151-abb8-6baad93715b5'
 
 // Paths relative to web/tests/
 const TENBOXD_PATH = process.env.TENBOXD_PATH || path.join(__dirname, '..', '..', 'build', 'tenboxd')
 const SERVER_JS_PATH = path.join(__dirname, '..', 'server.js')
+
+// If a dev server is already running on 3000, reuse it. Otherwise start our own.
+const DEV_PORT = '3000'
+const TEST_PORT = process.env.TEST_PORT || '3001'
+const TEST_SOCKET = process.env.TEST_SOCKET || '/tmp/tenbox-stability.sock'
+
+let UI_BASE = `http://localhost:${DEV_PORT}`
+let tenboxdProc = null
+let serverProc = null
+let usingOwnInfrastructure = false
 
 function waitFor(ms) {
   return new Promise((r) => setTimeout(r, ms))
@@ -35,27 +44,53 @@ function waitForLog(proc, regex, timeoutMs = 30000) {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(`http://localhost:3000/api${path}`, options)
+  const res = await fetch(`${UI_BASE}/api${path}`, options)
   return res.json()
 }
 
-test.describe('TenBoxd Stability', () => {
-  let tenboxdProc
-  let serverProc
+async function isDevServerReady() {
+  try {
+    const res = await fetch(`http://localhost:${DEV_PORT}/api/system/info`, { signal: AbortSignal.timeout(2000) })
+    const data = await res.json()
+    return data.ok === true
+  } catch {
+    return false
+  }
+}
 
+test.describe('TenBoxd Stability', () => {
   test.beforeAll(async () => {
-    // Clean up any stale socket so tenboxd can bind
-    const socketPaths = [
-      '/run/tenbox/tenbox.sock',
-      `${process.env.XDG_RUNTIME_DIR || '/tmp'}/tenbox.sock`,
-      `/tmp/tenbox-${process.getuid?.() || 0}.sock`,
-    ]
-    for (const sp of socketPaths) {
-      try { fs.unlinkSync(sp) } catch {}
+    // Try to reuse existing dev server first
+    if (await isDevServerReady()) {
+      console.log('[setup] Reusing existing dev server on port 3000')
+      UI_BASE = `http://localhost:${DEV_PORT}`
+      usingOwnInfrastructure = false
+
+      // Ensure VM is running on the dev server
+      const state = await api(`/vms/${VM_ID}`)
+      if (state.payload?.runtime?.state !== 'running') {
+        console.log('[setup] Starting VM on dev server...')
+        await api(`/vms/${VM_ID}/start`, { method: 'POST' })
+        for (let i = 0; i < 30; i++) {
+          await waitFor(2000)
+          const s = await api(`/vms/${VM_ID}`)
+          if (s.payload?.runtime?.state === 'running') break
+        }
+      }
+      console.log('[setup] VM is running (dev server)')
+      return
     }
 
+    // No dev server — start our own isolated infrastructure
+    console.log('[setup] No dev server found; starting own infrastructure...')
+    UI_BASE = `http://localhost:${TEST_PORT}`
+    usingOwnInfrastructure = true
+
+    // Clean up only our test socket
+    try { fs.unlinkSync(TEST_SOCKET) } catch {}
+
     console.log('[setup] Starting tenboxd...')
-    tenboxdProc = spawn(TENBOXD_PATH, [], {
+    tenboxdProc = spawn(TENBOXD_PATH, ['--socket', TEST_SOCKET, '--cloud-url', ''], {
       cwd: path.join(__dirname, '..', '..'),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -74,14 +109,11 @@ test.describe('TenBoxd Stability', () => {
     // Wait for tenboxd to create its socket
     let socketReady = false
     for (let i = 0; i < 30; i++) {
-      for (const sp of socketPaths) {
-        try {
-          fs.accessSync(sp, fs.constants.F_OK)
-          socketReady = true
-          break
-        } catch {}
-      }
-      if (socketReady) break
+      try {
+        fs.accessSync(TEST_SOCKET, fs.constants.F_OK)
+        socketReady = true
+        break
+      } catch {}
       await waitFor(1000)
     }
     if (!socketReady) throw new Error('tenboxd socket did not appear')
@@ -91,7 +123,7 @@ test.describe('TenBoxd Stability', () => {
     serverProc = spawn('node', [SERVER_JS_PATH], {
       cwd: path.join(__dirname, '..'),
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PORT: '3000' },
+      env: { ...process.env, PORT: TEST_PORT, TENBOX_SOCK: TEST_SOCKET },
     })
 
     let serverLogs = ''
@@ -105,7 +137,7 @@ test.describe('TenBoxd Stability', () => {
       }
     })
 
-    await waitForLog(serverProc, /listening on http:\/\/localhost:3000/, 15000)
+    await waitForLog(serverProc, new RegExp(`listening on http://localhost:${TEST_PORT}`), 15000)
     console.log('[setup] Web server ready')
 
     // Ensure VM is running
@@ -113,7 +145,7 @@ test.describe('TenBoxd Stability', () => {
     if (state.payload?.runtime?.state !== 'running') {
       console.log('[setup] Starting VM...')
       await api(`/vms/${VM_ID}/start`, { method: 'POST' })
-      for (let i = 0; i < 60; i++) {
+      for (let i = 0; i < 30; i++) {
         await waitFor(2000)
         const s = await api(`/vms/${VM_ID}`)
         if (s.payload?.runtime?.state === 'running') break
@@ -123,6 +155,10 @@ test.describe('TenBoxd Stability', () => {
   })
 
   test.afterAll(async () => {
+    if (!usingOwnInfrastructure) {
+      console.log('[teardown] Reusing dev server — no cleanup needed')
+      return
+    }
     console.log('[teardown] Cleaning up...')
     if (serverProc && !serverProc.killed) serverProc.kill('SIGTERM')
     if (tenboxdProc && !tenboxdProc.killed) tenboxdProc.kill('SIGTERM')
@@ -133,16 +169,20 @@ test.describe('TenBoxd Stability', () => {
   })
 
   test('remote desktop interaction does not crash tenboxd', async ({ page, context }) => {
-    // Track if tenboxd dies during the test
+    // This test clicks around for 60s; bump timeout to 120s.
+    test.setTimeout(120000)
+    // Track if tenboxd dies during the test (only meaningful when we own the process)
     let tenboxdDied = false
     let tenboxdExitCode = null
     let tenboxdSignal = null
 
-    tenboxdProc.on('exit', (code, signal) => {
-      tenboxdDied = true
-      tenboxdExitCode = code
-      tenboxdSignal = signal
-    })
+    if (usingOwnInfrastructure && tenboxdProc) {
+      tenboxdProc.on('exit', (code, signal) => {
+        tenboxdDied = true
+        tenboxdExitCode = code
+        tenboxdSignal = signal
+      })
+    }
 
     // Open remote desktop
     const rdPage = await context.newPage()

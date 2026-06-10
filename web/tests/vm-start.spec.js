@@ -1,7 +1,8 @@
 import { test, expect } from '@playwright/test'
 
-const API_BASE = 'http://localhost:3000/api'
-const UI_BASE = 'http://localhost:3000'
+const TEST_PORT = process.env.TEST_PORT || '3000'
+const API_BASE = `http://localhost:${TEST_PORT}/api`
+const UI_BASE = `http://localhost:${TEST_PORT}`
 
 async function apiVmState(vmId) {
   const res = await fetch(`${API_BASE}/vms/${vmId}`)
@@ -22,9 +23,24 @@ test.describe('VM Start Flow', () => {
     const maxWaitMs = 30000
     const pollIntervalMs = 1000
 
+    // Pre-flight: ensure backend is reachable
+    const health = await fetch(`${API_BASE}/system/info`).then(r => r.json()).catch(() => null)
+    if (!health?.ok) {
+      throw new Error(`Backend unreachable at ${API_BASE}. Is tenboxd running?`)
+    }
+
     // ── 1. Navigate to VM list ───────────────────────────────────────────────
     await page.goto(UI_BASE)
-    await page.waitForSelector('.vm-grid, .empty-state', { timeout: 10000 })
+    // Wait for loading to finish, then expect vm-grid or empty-state
+    await page.waitForFunction(() => {
+      return document.querySelector('.vm-grid, .empty-state, .card-white .body-md') !== null
+    }, null, { timeout: 15000 })
+
+    const errorCard = page.locator('.card-white .body-md')
+    if (await errorCard.isVisible().catch(() => false)) {
+      const errText = await errorCard.textContent()
+      throw new Error(`VM list failed to load: ${errText}`)
+    }
 
     // Take screenshot of initial state
     await page.screenshot({ path: 'tests/screenshots/01-initial-list.png' })
@@ -56,6 +72,9 @@ test.describe('VM Start Flow', () => {
       )
       await page.screenshot({ path: 'tests/screenshots/02-after-stop.png' })
     }
+
+    // Wait a moment for VMs to render
+    await page.waitForTimeout(500)
 
     // ── 2. Click Start ───────────────────────────────────────────────────────
     const startBtn = vmCard.locator('button:has-text("Start")')
@@ -133,8 +152,22 @@ test.describe('VM Start Flow', () => {
     const vmId = 'cda24e4e-1e7a-4151-abb8-6baad93715b5'
     const vmName = 'chromium-vm'
 
+    // Pre-flight: ensure backend is reachable
+    const health = await fetch(`${API_BASE}/system/info`).then(r => r.json()).catch(() => null)
+    if (!health?.ok) {
+      throw new Error(`Backend unreachable at ${API_BASE}. Is tenboxd running?`)
+    }
+
     await page.goto(UI_BASE)
-    await page.waitForSelector('.vm-grid, .empty-state', { timeout: 10000 })
+    await page.waitForFunction(() => {
+      return document.querySelector('.vm-grid, .empty-state, .card-white .body-md') !== null
+    }, null, { timeout: 15000 })
+
+    const errorCard = page.locator('.card-white .body-md')
+    if (await errorCard.isVisible().catch(() => false)) {
+      const errText = await errorCard.textContent()
+      throw new Error(`VM list failed to load: ${errText}`)
+    }
 
     const vmCard = page.locator('.vm-card').filter({ hasText: vmName })
     await expect(vmCard).toBeVisible()

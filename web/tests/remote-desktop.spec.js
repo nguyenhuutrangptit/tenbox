@@ -102,11 +102,11 @@ test.describe('Remote Desktop', () => {
     await rdPage.waitForTimeout(3000)
     await rdPage.screenshot({ path: 'tests/screenshots/rd-03-after-wait.png' })
 
-    // Verify we saw mousedown/mouseup in console
-    const hasMouseDown = logs.some((l) => l.includes('mousedown'))
-    const hasMouseUp = logs.some((l) => l.includes('mouseup'))
-    expect(hasMouseDown, 'should see mousedown in console').toBe(true)
-    expect(hasMouseUp, 'should see mouseup in console').toBe(true)
+    // Verify we saw pointerdown/pointerup in console
+    const hasPointerDown = logs.some((l) => l.includes('pointerdown'))
+    const hasPointerUp = logs.some((l) => l.includes('pointerup'))
+    expect(hasPointerDown, 'should see pointerdown in console').toBe(true)
+    expect(hasPointerUp, 'should see pointerup in console').toBe(true)
 
     // Verify channels are open
     const channelLog = logs.find((l) => l.includes('Control channel open'))
@@ -138,8 +138,8 @@ test.describe('Remote Desktop', () => {
     await rdPage.waitForTimeout(500)
 
     // Verify events were logged
-    expect(logs.some((l) => l.includes('mousedown'))).toBe(true)
-    expect(logs.some((l) => l.includes('mouseup'))).toBe(true)
+    expect(logs.some((l) => l.includes('pointerdown'))).toBe(true)
+    expect(logs.some((l) => l.includes('pointerup'))).toBe(true)
 
     // Verify at least one channel is open
     const controlOpen = logs.some((l) => l.includes('Control channel open'))
